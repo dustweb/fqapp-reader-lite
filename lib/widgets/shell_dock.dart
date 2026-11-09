@@ -30,7 +30,6 @@ class ShellDock extends StatelessWidget {
 
   static const _items = [
     GlassDockItem(CupertinoIcons.house, '首页'),
-    GlassDockItem(CupertinoIcons.play, '短剧', symbol: ArchiveSymbol.play),
     GlassDockItem(CupertinoIcons.book, '书架', symbol: ArchiveSymbol.shelf),
     GlassDockItem(CupertinoIcons.person_crop_circle, '我的'),
   ];

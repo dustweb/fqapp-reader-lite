@@ -2,7 +2,6 @@ import 'services/audio_downloader.dart';
 import 'widgets/desktop_app_frame.dart';
 import 'services/native_player.dart';
 import 'services/desktop_platform.dart';
-import 'services/platform_capabilities.dart';
 import 'services/platform_channel.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
@@ -53,7 +52,6 @@ import 'services/swipe_guide_store.dart';
 import 'services/third_party_licenses.dart';
 import 'widgets/lazy_indexed_stack.dart';
 import 'widgets/shell_dock.dart';
-import 'widgets/unsupported_feature_page.dart';
 import 'widgets/home/home_design.dart';
 
 Future<void> main() async {
@@ -516,14 +514,7 @@ class _RootShellState extends State<RootShell> {
   @override
   void initState() {
     super.initState();
-    // 短剧频道在推荐（视频流）与浅色页之间切换时，悬浮 dock 和系统导航栏
-    // 要跟着换肤，所以停在壳层的 build 里监听。
-    dramaLightPageNotifier.addListener(_onDramaChromeChanged);
     _startBackend();
-  }
-
-  void _onDramaChromeChanged() {
-    if (mounted) setState(() {});
   }
 
   Future<void> _startBackend() async {
@@ -546,7 +537,6 @@ class _RootShellState extends State<RootShell> {
 
   @override
   void dispose() {
-    dramaLightPageNotifier.removeListener(_onDramaChromeChanged);
     _homeScroll.dispose();
     super.dispose();
   }
@@ -624,17 +614,10 @@ class _RootShellState extends State<RootShell> {
         },
       );
     }
-    AudioFloatingRouteScope.configure(context, hidden: _index == 1);
+    AudioFloatingRouteScope.configure(context, hidden: false);
     final palette = HomePalette.of(context);
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    final isDramaTab = _index == 1;
-    // 短剧的推荐频道压在全屏视频流上，dock 用深色玻璃；看剧/漫剧/最近/收藏
-    // 是浅色页，dock 跟主题走，否则浅色外观下页面是奶白、dock 还是黑的。
-    final dramaOnVideo = isDramaTab && !dramaLightPageNotifier.value;
-    // 系统导航栏（Android 底部系统自绘的那条）按当前画布取色。Flutter 的
-    // light / dark 两套预设都把它写成纯黑底 + 白图标，浅色页面下会在最底部
-    // 留一条突兀的黑带；短剧只有视频流（推荐）背后是视频，仍用黑。
-    final lightSystemIcons = dramaOnVideo || isDark;
+    final lightSystemIcons = isDark;
     return Scaffold(
       extendBody: true,
       // 状态栏图标亮度挂在壳层、按选中 tab 切换：短剧页是黑底视频流（官方
@@ -650,15 +633,9 @@ class _RootShellState extends State<RootShell> {
                 .copyWith(
                   // 状态栏显式铺成画布色：透明状态栏在 Android 10+ 会被系统
                   // 叠一层对比度黑纱，奶白画布会被压成灰带。短剧视频流仍透明。
-                  statusBarColor: dramaOnVideo
-                      ? Colors.transparent
-                      : palette.canvas,
-                  systemNavigationBarColor: dramaOnVideo
-                      ? Colors.black
-                      : palette.canvas,
-                  systemNavigationBarDividerColor: dramaOnVideo
-                      ? Colors.black
-                      : palette.canvas,
+                  statusBarColor: palette.canvas,
+                  systemNavigationBarColor: palette.canvas,
+                  systemNavigationBarDividerColor: palette.canvas,
                   systemNavigationBarIconBrightness: lightSystemIcons
                       ? Brightness.light
                       : Brightness.dark,
@@ -670,21 +647,10 @@ class _RootShellState extends State<RootShell> {
               scrollController: _homeScroll,
               cueLoader: ApiClient.instance.searchCue,
             ),
-            // iOS 首版没有原生播放器实现：把短剧页换成「暂不支持」占位，
-            // 避免进入播放页时触发缺失的 fqapp/native_player 通道。
-            if (supportsVideoPlayback)
-              const DramaPage()
-            else
-              const UnsupportedFeaturePage(
-                icon: LucideIcons.clapperboard,
-                title: '短剧暂不支持',
-                description: '当前平台没有内置视频播放器。搜书、书架和阅读可以正常使用。',
-              ),
             // 空书架上的「去书城找书」切回首页 tab；收藏空态的「找短剧」
             // 切到短剧 tab。
             LibraryPage(
               onBrowse: () => setState(() => _index = 0),
-              onFindDrama: () => setState(() => _index = 1),
             ),
             const MinePage(),
           ],
@@ -695,8 +661,8 @@ class _RootShellState extends State<RootShell> {
       bottomNavigationBar: ShellDock(
         selectedIndex: _index,
         onSelected: _selectTab,
-        overVideo: dramaOnVideo,
-        staticMaterial: shellDockStaticMaterial(overVideo: dramaOnVideo),
+        overVideo: false,
+        staticMaterial: shellDockStaticMaterial(overVideo: false),
       ),
     );
   }

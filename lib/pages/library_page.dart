@@ -69,7 +69,7 @@ part 'library_shelf_widgets.dart';
 
 /// 顶栏一级 tab 的官方文案（amg.xml 的 SlidingTabLayout；顺序同官方
 /// 书架页：书架 / 历史 / 收藏）。官方还有「圈子」，本地无此功能不设。
-const _tabTitles = ['书架', '浏览历史', '收藏'];
+const _tabTitles = ['书架', '浏览历史'];
 
 /// 官方分工：书架 tab 只放书籍类，追剧 / 追漫的视频类只进「收藏」tab
 /// （与短剧页收藏频道同一批 [ShelfStore] 数据）。
@@ -355,14 +355,16 @@ mixin _LibraryPageStateBase on State<LibraryPage>, WidgetsBindingObserver {
       final records = ShelfStore.instance.records();
       _shelf = _shelfEntries([
         for (final record in records)
-          if (!_isVideoKind(record.item.kind)) record,
+          if (record.item.kind == 'book' || record.item.kind == 'audio') record,
       ], byIdentity);
       _collection = _shelfEntries([
         for (final record in records)
           if (_isVideoKind(record.item.kind)) record,
       ], byIdentity);
       _browseHistory = [
-        for (final entry in history) _ShelfEntry.fromHistory(entry),
+        for (final entry in history)
+          if (entry['kind'] == null || entry['kind'] == 'book' || entry['kind'] == 'audio')
+            _ShelfEntry.fromHistory(entry),
       ];
       // 选中集合随数据回真：条目在别处被移出 / 删除后，它的键不该继续占着
       // 「已选择 N 本」，也不该把全选判定带偏。

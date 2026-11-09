@@ -84,6 +84,14 @@ class HomePage extends ConsumerStatefulWidget {
 }
 
 class _HomePageState extends ConsumerState<HomePage> {
+  // Keep the provider's original IDs so the audio feed and cached pages stay aligned.
+  static const _liteTabs = <int>[0, 1, 5];
+  static const _liteCategories = <HomeCategory>[
+    HomeCategory('推荐'),
+    HomeCategory('小说'),
+    HomeCategory('听书'),
+  ];
+
   late final ScrollController _scroll =
       widget.scrollController ?? ScrollController();
   bool get _ownsScroll => widget.scrollController == null;
@@ -221,6 +229,8 @@ class _HomePageState extends ConsumerState<HomePage> {
   }
 
   void _selectTab(int index) {
+    if (index < 0 || index >= _liteTabs.length) return;
+    index = _liteTabs[index];
     if (index == ref.read(homeProvider).tabIndex) return;
     // Both headers are outside the viewport, so content starts at zero.
     if (_scroll.hasClients) _scroll.jumpTo(0);
@@ -268,7 +278,12 @@ class _HomePageState extends ConsumerState<HomePage> {
   /// 2026-10-24 用户决定回退服务端 11 项方案——服务端表没有「短剧/漫剧」，
   /// 跨媒介入口只能本地给；点击身份由 `homeProvider` 的 `usesLocalTabs`
   /// 本地表驱动，与这里的下标一一对应。
-  List<HomeCategory> _categoriesOf(HomeState state) => homeCategories;
+  List<HomeCategory> _categoriesOf(HomeState state) => _liteCategories;
+
+  int _displayTabIndex(HomeState state) {
+    final index = _liteTabs.indexOf(state.tabIndex);
+    return index < 0 ? 0 : index;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -309,7 +324,7 @@ class _HomePageState extends ConsumerState<HomePage> {
                     onCategory: _openCategory,
                   ),
                 HomeTabBar(
-                  selectedIndex: state.tabIndex,
+                  selectedIndex: _displayTabIndex(state),
                   onSelect: _selectTab,
                   categories: categories,
                 ),
@@ -328,7 +343,7 @@ class _HomePageState extends ConsumerState<HomePage> {
                       );
                       return ClipRect(
                         child: TabSwipeArea(
-                          index: state.tabIndex,
+                          index: _displayTabIndex(state),
                           count: categories.length,
                           onSelect: _selectTab,
                           previewBuilder: (target) =>
@@ -374,10 +389,10 @@ class _HomePageState extends ConsumerState<HomePage> {
   }
 
   Widget _buildTabPreview(int target, Color canvas) {
-    if (target < 0 || target >= homeCategories.length) {
+    if (target < 0 || target >= _liteTabs.length) {
       return const SizedBox.shrink();
     }
-    final body = _previewBodies[target];
+    final body = _previewBodies[_liteTabs[target]];
     return ColoredBox(
       color: canvas,
       child: CustomScrollView(

@@ -81,7 +81,7 @@ class SearchPage extends StatefulWidget {
     this.suggestLoader,
     this.hotSearchLoader,
     this.shuqiSearchLoader,
-    this.initialCategory = SearchCategory.general,
+    this.initialCategory = SearchCategory.book,
   });
 
   @override
@@ -90,7 +90,7 @@ class SearchPage extends StatefulWidget {
 
 class _SearchPageState extends State<SearchPage> {
   static const _paginationThreshold = 480.0;
-  static const _categories = SearchCategory.values;
+  static const _categories = [SearchCategory.book, SearchCategory.audio];
   static const _listViewPreference = 'search_list_view';
   static const _minimumScorePreference = 'search_minimum_score';
 
@@ -176,7 +176,8 @@ class _SearchPageState extends State<SearchPage> {
   void initState() {
     super.initState();
     // 首帧就停在该页签：分区入口（短剧/漫剧）进来的搜索不该先闪「综合」。
-    _tabIndex = _categories.indexOf(widget.initialCategory);
+    final initialTab = _categories.indexOf(widget.initialCategory);
+    _tabIndex = initialTab < 0 ? 0 : initialTab;
     _scrollController.addListener(_onScroll);
     _loadHistory();
     unawaited(_loadLayout());

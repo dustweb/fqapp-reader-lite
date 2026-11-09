@@ -40,7 +40,7 @@ mixin _LibraryShelfChrome on _LibraryPageActions {
     context,
     key: const Key('library-tabs'),
     groupValue: _tab,
-    children: const {0: Text('书架'), 1: Text('浏览历史'), 2: Text('收藏')},
+    children: const {0: Text('书架'), 1: Text('浏览历史')},
     onValueChanged: (value) {
       if (value != null) _selectTab(value);
     },

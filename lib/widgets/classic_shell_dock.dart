@@ -84,11 +84,6 @@ class ClassicShellDock extends StatelessWidget {
             label: '首页',
           ),
           NavigationDestination(
-            icon: Icon(LucideIcons.clapperboard),
-            selectedIcon: Icon(LucideIcons.clapperboard),
-            label: '短剧',
-          ),
-          NavigationDestination(
             icon: Icon(LucideIcons.library_big),
             selectedIcon: Icon(LucideIcons.library_big),
             label: '书架',
@@ -158,7 +153,7 @@ class ClassicShellDock extends StatelessWidget {
                       ),
                       child: navBar,
                     )
-                  : selectedIndex == 1 || oled
+                  : overVideo || oled
                   ? staticBar
                   : BackdropFilter(
                       filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),

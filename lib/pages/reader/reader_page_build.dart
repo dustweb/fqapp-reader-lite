@@ -358,6 +358,13 @@ extension _ReaderPageBuild on _ReaderPageState {
             onPressed: () => Navigator.pop(menu, 'shelf'),
           ),
           GlassMenuItem(
+            key: const ValueKey('reader-paragraph-bubbles-toggle'),
+            icon: CupertinoIcons.chat_bubble,
+            label: _preferences.showParagraphBubbles ? '段评气泡：已开启' : '段评气泡：已关闭',
+            selected: _preferences.showParagraphBubbles,
+            onPressed: () => Navigator.pop(menu, 'paragraph-bubbles'),
+          ),
+          GlassMenuItem(
             icon: CupertinoIcons.textformat,
             label: '阅读设置',
             order: 3,
@@ -380,6 +387,11 @@ extension _ReaderPageBuild on _ReaderPageState {
         await _showIdeas(focusParaIndex: _chapterEndParagraph());
       case 'shelf':
         await toggleShelf(context, _shelfEntry);
+      case 'paragraph-bubbles':
+        _previewPreferences(
+          _preferences.copyWith(showParagraphBubbles: !_preferences.showParagraphBubbles),
+        );
+        await _savePreferences();
       case 'settings':
         await _showAppearanceSettings();
       case 'hide':

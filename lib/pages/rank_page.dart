@@ -108,7 +108,24 @@ class _RankPageState extends State<RankPage> {
     } else {
       unawaited(_cache.saveCatalog(catalog));
     }
-    setState(() => _catalog = catalog);
+    // The lite app keeps only book and audio rankings.
+    catalog = RankCatalog(
+      rankId: catalog.rankId,
+      tabs: catalog.tabs.where((tab) => !tab.isDrama && !tab.name.contains('漫画')).toList(),
+      categories: catalog.categories,
+    );
+    if (catalog.tabs.isEmpty) {
+      setState(() {
+        _loading = false;
+        _error = '排行榜暂时不可用';
+      });
+      return;
+    }
+    setState(() {
+      _catalog = catalog;
+      _rankIndex = 0;
+      _categoryIndex = 0;
+    });
     await _loadFirst(generation);
   }
 

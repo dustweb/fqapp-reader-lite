@@ -131,7 +131,7 @@ class SettingsPage extends StatelessWidget {
           ),
         ],
       ),
-      SettingsCategory(
+      if (isWindowsDesktop) SettingsCategory(
         icon: SettingsCategoryIcons.drama,
         title: '短剧',
         subtitle: '播放',
@@ -164,7 +164,7 @@ class SettingsPage extends StatelessWidget {
               MaterialPageRoute(builder: (_) => const CachedBooksPage()),
             ),
           ),
-          SettingsItem(
+          if (isWindowsDesktop) SettingsItem(
             icon: CupertinoIcons.play_rectangle,
             title: '短剧离线缓存',
             subtitle: '短剧下载、离线播放和清理缓存',

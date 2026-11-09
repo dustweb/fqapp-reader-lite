@@ -685,6 +685,26 @@ void main() {
       expect(find.byKey(const ValueKey('reader-cache')), findsOneWidget);
     });
 
+    testWidgets('more menu toggles and persists paragraph bubbles', (tester) async {
+      await pumpReader(tester, ideasLoader: (_) async => _ideas());
+      expect(find.text('12'), findsOneWidget);
+      await openControls(tester);
+      await tester.tap(find.byKey(const ValueKey('reader-header-more')));
+      await tester.pumpAndSettle();
+      expect(find.text('段评气泡：已开启'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('reader-paragraph-bubbles-toggle')));
+      await tester.pumpAndSettle();
+      expect(find.text('12'), findsNothing);
+      expect((await ReaderPreferences.load()).showParagraphBubbles, isFalse);
+      await tester.tap(find.byKey(const ValueKey('reader-header-more')));
+      await tester.pumpAndSettle();
+      expect(find.text('段评气泡：已关闭'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('reader-paragraph-bubbles-toggle')));
+      await tester.pumpAndSettle();
+      expect(find.text('12'), findsOneWidget);
+      expect((await ReaderPreferences.load()).showParagraphBubbles, isTrue);
+    });
+
     testWidgets('a failed idea load leaves the reader usable', (tester) async {
       await pumpReader(
         tester,

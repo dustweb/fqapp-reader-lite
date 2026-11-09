@@ -238,7 +238,10 @@ class _CategoryPageState extends State<CategoryPage> {
         child: Column(
           children: [
             _TopBar(
-              tabs: front?.tabs ?? const [],
+              tabs: [
+                for (final tab in front?.tabs ?? <CategoryTab>[])
+                  if (tab.value != '5' && tab.value != '6') tab,
+              ],
               selected: _tabValue,
               onSelect: (v) => _load(tab: int.tryParse(v) ?? 1),
               onSearch: _openSearch,
