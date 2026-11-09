@@ -79,7 +79,7 @@ jobs:
       - name: Test reading and paragraph comments
         run: flutter test --no-pub test/reader_ideas_test.dart
       - name: Build Rust libraries
-        run: bash ./scripts/build_rust_backend.sh --skip-codegen
+        run: ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION" bash ./scripts/build_rust_backend.sh --skip-codegen
       - name: Build signed APKs
         env:
           RELEASE_KEYSTORE_FILE: ${{ runner.temp }}/reader-lite.jks

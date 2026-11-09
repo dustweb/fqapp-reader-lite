@@ -43,6 +43,6 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "ndk;$NDK_VERSION" 'cmake;3.22.1' 'platforms;android-36' 'build-tools;36.0.0'
       - run: flutter pub get --enforce-lockfile
-      - run: bash ./scripts/build_rust_backend.sh --skip-codegen
+      - run: ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION" bash ./scripts/build_rust_backend.sh --skip-codegen
       - name: Compile unsigned APK for validation only
         run: flutter build apk --release --target-platform android-arm,android-arm64 --split-per-abi
