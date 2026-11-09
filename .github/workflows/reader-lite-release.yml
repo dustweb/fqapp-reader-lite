@@ -1,0 +1,50 @@
+name: Publish Reader Lite release
+
+on:
+  workflow_run:
+    workflows: ['Reader Lite Android APK']
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful signed APK workflow run ID
+        required: true
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish verified APKs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+        run: |
+          set -euo pipefail
+          metadata=$(gh run view "$RUN_ID" --repo "$REPOSITORY" --json conclusion,event,headBranch,headSha,name,number,status)
+          jq -e '.status == "completed" and .conclusion == "success" and .name == "Reader Lite Android APK" and .headBranch == "master"' <<< "$metadata" >/dev/null
+          number=$(jq -r '.number' <<< "$metadata")
+          commit=$(jq -r '.headSha' <<< "$metadata")
+          tag="reader-lite-${number}"
+          if gh release view "$tag" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            echo 'Release already exists.'
+            exit 0
+          fi
+          mkdir -p dist
+          gh run download "$RUN_ID" --repo "$REPOSITORY" --name "reader-lite-apk-${number}" --dir dist
+          test -f dist/app-arm64-v8a-release.apk
+          test -f dist/app-armeabi-v7a-release.apk
+          for apk in dist/*.apk; do
+            expected=$(cut -d ' ' -f 1 "$apk.sha256")
+            actual=$(sha256sum "$apk" | cut -d ' ' -f 1)
+            [ "$actual" = "$expected" ] || { echo '::error::Artifact checksum mismatch.'; exit 1; }
+          done
+          gh release create "$tag" dist/*.apk dist/*.apk.sha256 dist/*.apk.signer.txt \
+            --repo "$REPOSITORY" --target "$commit" --title "阅读听书精简版 ${number}" \
+            --notes 'Android 阅读听书精简版。大多数现代手机请选择 arm64-v8a；旧款 32 位手机请选择 armeabi-v7a。安装前请备份原版数据。'
