@@ -37,15 +37,21 @@ jobs:
           branch="sync/upstream-$upstream_sha"
           if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
             echo "Update branch already exists: $branch"
-            exit 0
+          else
+            git switch -c "$branch"
+            if ! git merge --no-edit --no-ff FETCH_HEAD; then
+              git merge --abort
+              echo '::error::Upstream changes conflict with the lite version; a manual merge is required.'
+              exit 1
+            fi
+            git push origin "$branch"
           fi
-          git switch -c "$branch"
-          if ! git merge --no-edit --no-ff FETCH_HEAD; then
-            git merge --abort
-            echo '::error::Upstream changes conflict with the lite version; a manual merge is required.'
-            exit 1
-          fi
-          git push origin "$branch"
-          gh pr create --base master --head "$branch" \
+          compare_url="https://github.com/$GITHUB_REPOSITORY/compare/master...$branch?expand=1"
+          echo "上游更新分支：[$branch]($compare_url)" >> "$GITHUB_STEP_SUMMARY"
+          if gh pr view "$branch" --json number >/dev/null 2>&1; then
+            echo 'A pull request already exists.'
+          elif ! gh pr create --base master --head "$branch" \
             --title "同步上游更新 ($upstream_sha)" \
-            --body '此更新合并了上游 master。请检查精简界面、阅读和听书功能，再合并；如有冲突请手动处理。'
+            --body '此更新合并了上游 master。请检查精简界面、阅读和听书功能，再合并；如有冲突请手动处理。'; then
+            echo '::warning::Automatic pull request creation is unavailable. Open the compare link in the workflow summary to create it manually.'
+          fi
