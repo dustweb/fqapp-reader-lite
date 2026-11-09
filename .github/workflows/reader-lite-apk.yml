@@ -15,6 +15,7 @@ concurrency:
 env:
   FLUTTER_VERSION: '3.47.9'
   NDK_VERSION: '28.2.13676358'
+  EXPECTED_SIGNER_SHA256: 'f9875fede094af89abe163c14090ca5b27b8817e1dc30cfd9669a43e00ac3807'
   FQAPP_USE_MAVEN_MIRRORS: 'false'
   CARGO_BUILD_JOBS: '2'
   CMAKE_BUILD_PARALLEL_LEVEL: '2'
@@ -33,29 +34,8 @@ jobs:
           java-version: '17'
       - name: Restore and verify the persistent release key
         env:
-          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
-          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
-          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
-          EXPECTED_SIGNER_SHA256: ${{ vars.READER_LITE_SIGNER_SHA256 }}
-        run: |
-          set -euo pipefail
-          for name in RELEASE_KEYSTORE_BASE64 RELEASE_STORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD EXPECTED_SIGNER_SHA256; do
-            if [ -z "${!name}" ]; then
-              echo "::error::Missing $name; refusing to build an unsigned or differently signed APK."
-              exit 1
-            fi
-          done
-          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/reader-lite.jks"
-          chmod 600 "$RUNNER_TEMP/reader-lite.jks"
-          actual=$(keytool -list -v -keystore "$RUNNER_TEMP/reader-lite.jks" \
-            -storepass:env RELEASE_STORE_PASSWORD -alias "$RELEASE_KEY_ALIAS" \
-            | sed -n 's/^[[:space:]]*SHA256: //p' | tr -d ':' | tr '[:upper:]' '[:lower:]')
-          expected=$(printf '%s' "$EXPECTED_SIGNER_SHA256" | tr -d ': ' | tr '[:upper:]' '[:lower:]')
-          if [ -z "$actual" ] || [ "$actual" != "$expected" ]; then
-            echo '::error::Signing certificate fingerprint does not match the pinned value.'
-            exit 1
-          fi
+          READER_LITE_SIGNING_JSON: ${{ secrets.READER_LITE_SIGNING_JSON }}
+        run: python3 scripts/reader_lite_signing.py
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: '1.99.1'
@@ -81,15 +61,8 @@ jobs:
       - name: Build Rust libraries
         run: ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION" bash ./scripts/build_rust_backend.sh --skip-codegen
       - name: Build signed APKs
-        env:
-          RELEASE_KEYSTORE_FILE: ${{ runner.temp }}/reader-lite.jks
-          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
-          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: flutter build apk --release --target-platform android-arm,android-arm64 --split-per-abi --build-number "$((100000 + GITHUB_RUN_NUMBER))"
       - name: Verify APK signatures
-        env:
-          EXPECTED_SIGNER_SHA256: ${{ vars.READER_LITE_SIGNER_SHA256 }}
         run: |
           set -euo pipefail
           expected=$(printf '%s' "$EXPECTED_SIGNER_SHA256" | tr -d ': ' | tr '[:upper:]' '[:lower:]')
