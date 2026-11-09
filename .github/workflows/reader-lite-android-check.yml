@@ -2,6 +2,15 @@ name: Reader Lite Android compile check
 on:
   push:
     branches: [master]
+    paths:
+      - lib/**
+      - android/**
+      - native/**
+      - rust/**
+      - assets/**
+      - pubspec.yaml
+      - pubspec.lock
+      - scripts/build_rust_backend.sh
   workflow_dispatch:
 permissions:
   contents: read
