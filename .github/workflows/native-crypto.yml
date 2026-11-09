@@ -26,6 +26,7 @@ permissions:
 
 jobs:
   native:
+    if: github.repository == 'ch6vip/fqapp'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

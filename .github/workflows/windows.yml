@@ -36,6 +36,7 @@ concurrency:
 
 jobs:
   build-windows:
+    if: github.repository == 'ch6vip/fqapp'
     runs-on: windows-latest
     timeout-minutes: 45
     steps:

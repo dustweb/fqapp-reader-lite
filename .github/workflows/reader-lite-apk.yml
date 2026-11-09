@@ -2,7 +2,7 @@ name: Reader Lite Android APK
 
 on:
   push:
-    branches: [reader-lite]
+    branches: [master]
   workflow_dispatch:
 
 permissions:

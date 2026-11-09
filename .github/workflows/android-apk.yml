@@ -78,6 +78,7 @@ env:
 
 jobs:
   apk:
+    if: github.repository == 'ch6vip/fqapp'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     defaults:
@@ -635,6 +636,7 @@ jobs:
   # full run (2000+ tests) the apk job used to execute, and scripts/test_quick.sh
   # documents that full run as the pre-handoff gate.
   dart-gate:
+    if: github.repository == 'ch6vip/fqapp'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:

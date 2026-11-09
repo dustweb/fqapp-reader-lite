@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: reader-lite
+          ref: master
           fetch-depth: 0
       - name: Prepare upstream merge for review
         env:
@@ -46,6 +46,6 @@ jobs:
             exit 1
           fi
           git push origin "$branch"
-          gh pr create --base reader-lite --head "$branch" \
+          gh pr create --base master --head "$branch" \
             --title "同步上游更新 ($upstream_sha)" \
             --body '此更新合并了上游 master。请检查精简界面、阅读和听书功能，再合并；如有冲突请手动处理。'

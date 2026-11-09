@@ -4,7 +4,7 @@
 
 ## 持续构建与固定签名
 
-工作流 `Reader Lite Android APK` 在 `reader-lite` 分支更新或手动触发时运行。首次运行前，仓库所有者须在 Settings → Secrets and variables → Actions 中配置：
+工作流 `Reader Lite Android APK` 在 `master` 分支更新或手动触发时运行。首次运行前，仓库所有者须在 Settings → Secrets and variables → Actions 中配置：
 
 * Secrets：`RELEASE_KEYSTORE_BASE64`（keystore 文件的 base64）、`RELEASE_STORE_PASSWORD`、`RELEASE_KEY_ALIAS`、`RELEASE_KEY_PASSWORD`。
 * Variables：`READER_LITE_SIGNER_SHA256`（该密钥证书 SHA-256 指纹）。
