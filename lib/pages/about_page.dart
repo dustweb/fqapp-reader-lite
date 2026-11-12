@@ -110,7 +110,7 @@ class AboutPage extends StatelessWidget {
                   subtitle: '前往 GitHub 发布页查看新版本',
                   onTap: () => _launchExternalUrl(
                     context,
-                    'https://github.com/ch6vip/fqapp/releases',
+                    'https://github.com/dustweb/fqapp-reader-lite/releases',
                   ),
                 ),
                 _InfoRow(
