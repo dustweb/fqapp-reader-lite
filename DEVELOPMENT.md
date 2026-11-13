@@ -11,6 +11,7 @@
 - [架构总览](#架构总览)
 - [项目结构](#项目结构)
 - [注释与公开依据](#注释与公开依据)
+- [代码格式](#代码格式)
 - [构建环境](#构建环境)
 - [构建 APK](#构建-apk)
 - [测试](#测试)
@@ -146,6 +147,21 @@ novel-sound/
 或历史测试结果当成界面一致性的证据。
 
 ---
+
+## 代码格式
+
+统一入口为 `scripts/format_all.ps1` / `scripts/format_all.sh`，首阶段覆盖 Dart、
+手写 Rust 与已有 JavaScript 脚本。首次运行 `npm ci --ignore-scripts` 安装锁定的
+Prettier；工具版本、排除范围、按改动格式化及 CI 策略见
+[脚本说明](scripts/README.md#统一代码格式)。
+
+```powershell
+.\scripts\format_all.ps1 -Since origin/master
+.\scripts\format_all.ps1 -Check -Since origin/master
+```
+
+Linux/macOS 对应 `bash scripts/format_all.sh --since origin/master`，加 `--check`
+只检查；省略改动范围则处理全部支持的源码。
 
 ## 构建环境
 
@@ -1203,7 +1219,11 @@ WebDAV 配置与诊断由数据同步功能负责。
 ## Linux / Arch x86_64（实验性运行基础）
 
 支持 Linux runner、bundle 内 Rust 核心、阅读/书架及 TXT/EPUB 本地导入。
-听书播放和系统朗读/桌面集成分别见下方第二、三批说明；短剧视频、Android 系统栏、备份文件选择等未实现通道明确报告暂不支持。
+听书播放和系统朗读/桌面集成分别见下方第二、三批说明；备份导出与恢复文件选择复用桌面 JSON 文件选择器，取消不会保存或导入；
+备份格式、16 MB 校验、预览及只补缺失数据的合并规则沿用现有实现。
+小说缓存 TXT 与日志导出使用同一桌面保存对话框，按用户选择的位置保存 UTF-8 文本；
+取消或写入失败不报告成功。
+短剧视频、Android 系统栏等未实现通道明确报告暂不支持。
 第四批提供实验性 Arch 打包脚本与 Linux CI artifact，不提供正式 Release。
 构建溯源、安装/卸载、升级回退边界与依赖见 [LINUX.md](LINUX.md)。
 

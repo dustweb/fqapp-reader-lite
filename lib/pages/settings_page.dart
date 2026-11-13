@@ -31,6 +31,7 @@ import '../services/app_theme_style.dart';
 import '../services/app_style_tokens.dart';
 import '../services/audio_preferences.dart';
 import '../services/desktop_platform.dart';
+import '../services/linux_platform.dart' show isLinuxDesktop;
 import '../services/native_player.dart';
 import '../services/player_layout_preferences.dart';
 import '../services/player_preferences.dart';
@@ -52,6 +53,7 @@ import 'settings_category_page.dart';
 import 'system_tts_settings_page.dart';
 import 'text_replacement_page.dart';
 import 'theme_page.dart';
+import 'reader_preferences_page.dart';
 import 'ai_reading/settings/ai_settings_page.dart';
 
 /// Settings home: a list of category entries (PiliPlus multi-level
@@ -68,12 +70,14 @@ class SettingsPage extends StatelessWidget {
       SettingsCategory(
         icon: SettingsCategoryIcons.appearance,
         title: '外观',
-        subtitle: HapticPreferences.supported
+        subtitle: isMediaDesktop
+            ? '主题模式、OLED 纯黑'
+            : HapticPreferences.supported
             ? '主题模式、振动反馈、播放页布局'
             : '主题模式、OLED 纯黑、播放页布局',
         // 用 builder 而不是固定 items：切到深色 / 切回浅色后，分类页重建
         // 时会重新判定，OLED 行不必退出重进就能出现或消失。
-        // 播放页布局只在手机端有效（Windows 由 DesktopVideoChrome 承担）。
+        // 播放页布局只在手机端有效（Windows/Linux 由桌面播放器承担）。
         itemsBuilder: (context) => [
           _themeModeItem(),
           if (HapticPreferences.supported) _hapticsItem(),
@@ -81,7 +85,7 @@ class SettingsPage extends StatelessWidget {
             systemBrightness: MediaQuery.platformBrightnessOf(context),
           ))
             _oledModeItem(),
-          if (!isWindowsDesktop) _playerLayoutItem(),
+          if (!isMediaDesktop) _playerLayoutItem(),
         ],
       ),
       SettingsCategory(
@@ -97,6 +101,15 @@ class SettingsPage extends StatelessWidget {
         title: '阅读',
         subtitle: '阅读入口、正文替换、AI 阅读优化',
         items: [
+          SettingsItem(
+            icon: LucideIcons.book_open_check,
+            title: '小说阅读器',
+            subtitle: '阅读背景、翻页、字体与版面',
+            onTap: (context, _) => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const ReaderPreferencesPage()),
+            ),
+          ),
           _shelfDirectReaderItem(),
           _discoverDirectReaderItem(),
           SettingsItem(
@@ -125,7 +138,7 @@ class SettingsPage extends StatelessWidget {
         subtitle: '后台播放、通知栏控制与系统朗读',
         items: [
           _backgroundAudioItem(),
-          if (!isWindowsDesktop) _audioRateEngineItem(),
+          if (!isMediaDesktop) _audioRateEngineItem(),
           SettingsItem(
             icon: CupertinoIcons.mic,
             title: '系统朗读',
@@ -143,8 +156,8 @@ class SettingsPage extends StatelessWidget {
         subtitle: '播放',
         items: [
           _muteWhenColdStartItem(),
-          if (!isWindowsDesktop) _floatingWindowItem(),
-          if (!isWindowsDesktop) _videoDecoderItem(),
+          if (!isMediaDesktop) _floatingWindowItem(),
+          if (!isMediaDesktop) _videoDecoderItem(),
         ],
       ),
       SettingsCategory(
@@ -173,7 +186,7 @@ class SettingsPage extends StatelessWidget {
           if (isWindowsDesktop) SettingsItem(
             icon: CupertinoIcons.play_rectangle,
             title: '短剧离线缓存',
-            subtitle: '短剧下载、离线播放和清理缓存',
+            subtitle: isLinuxDesktop ? '管理已下载文件和下载任务' : '短剧下载、离线播放和清理缓存',
             onTap: (context, _) => Navigator.push(
               context,
               MaterialPageRoute(builder: (_) => const CachedDramasPage()),

@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/services/desktop_platform.dart';
+import 'package:fqapp/services/book_txt_export.dart';
 import 'package:fqapp/services/desktop_media.dart';
 import 'package:flutter/foundation.dart';
 import 'package:fqapp/services/platform_channel.dart';
@@ -351,6 +352,170 @@ void main() {
       expect(destroyed.isCompleted, isFalse);
       stopped.complete();
       await destroyed.future;
+    },
+  );
+
+  test('Linux backup selection saves bytes, reads and cancels', () async {
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    const selector = MethodChannel('plugins.flutter.io/file_selector');
+    messenger.setMockMethodCallHandler(
+      const MethodChannel('window_manager'),
+      (_) async => null,
+    );
+    final directory = await Directory.systemTemp.createTemp('linux-backup-');
+    addTearDown(() async {
+      messenger.setMockMethodCallHandler(selector, null);
+      messenger.setMockMethodCallHandler(
+        const MethodChannel('window_manager'),
+        null,
+      );
+      await directory.delete(recursive: true);
+    });
+    final file = File('${directory.path}/备份.json');
+    var cancelled = false;
+    var unavailable = false;
+    messenger.setMockMethodCallHandler(selector, (call) async {
+      if (unavailable) throw PlatformException(code: 'dialog_unavailable');
+      if (cancelled) return null;
+      final args = call.arguments as Map;
+      expect((args['acceptedTypeGroups'] as List).single['extensions'], [
+        'json',
+      ]);
+      if (call.method == 'getSavePath') {
+        expect(args['suggestedName'], 'backup.json');
+        return file.path;
+      }
+      expect(call.method, 'openFile');
+      return [file.path];
+    });
+    await LinuxPlatform.install();
+    const channel = AppMethodChannel('fqapp/library_backup');
+    final bytes = Uint8List.fromList([123, 125]);
+    expect(
+      await channel.invokeMethod<bool>('saveBackup', {
+        'name': 'backup.json',
+        'bytes': bytes,
+      }),
+      isTrue,
+    );
+    expect(await file.readAsBytes(), bytes);
+    expect(await channel.invokeMethod<Uint8List>('openBackup'), bytes);
+    cancelled = true;
+    expect(
+      await channel.invokeMethod<bool>('saveBackup', {
+        'name': 'backup.json',
+        'bytes': Uint8List(0),
+      }),
+      isFalse,
+    );
+    expect(await channel.invokeMethod<Uint8List>('openBackup'), isNull);
+    expect(await file.readAsBytes(), bytes);
+    cancelled = false;
+    unavailable = true;
+    await expectLater(
+      channel.invokeMethod<Uint8List>('openBackup'),
+      throwsA(
+        isA<PlatformException>().having(
+          (e) => e.code,
+          'code',
+          'dialog_unavailable',
+        ),
+      ),
+    );
+    await expectLater(
+      channel.invokeMethod<void>('storeFanqieCapture'),
+      throwsA(
+        isA<PlatformException>().having(
+          (e) => e.code,
+          'code',
+          'unsupported_platform',
+        ),
+      ),
+    );
+  });
+
+  test(
+    'Linux TXT sink saves UTF-8 and reports cancellation and failures',
+    () async {
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      const selector = MethodChannel('plugins.flutter.io/file_selector');
+      const window = MethodChannel('window_manager');
+      messenger.setMockMethodCallHandler(window, (_) async => null);
+      final directory = await Directory.systemTemp.createTemp(
+        'linux-text-export-',
+      );
+      addTearDown(() async {
+        messenger.setMockMethodCallHandler(selector, null);
+        messenger.setMockMethodCallHandler(window, null);
+        await directory.delete(recursive: true);
+      });
+      final file = File('${directory.path}/小说与日志.txt');
+      String? selectedPath = file.path;
+      var unavailable = false;
+      messenger.setMockMethodCallHandler(selector, (call) async {
+        expect(call.method, 'getSavePath');
+        final args = call.arguments as Map;
+        expect(args['suggestedName'], '导出.txt');
+        expect((args['acceptedTypeGroups'] as List).single['extensions'], [
+          'txt',
+        ]);
+        if (unavailable) {
+          throw PlatformException(
+            code: 'dialog_unavailable',
+            message: '选择器不可用',
+          );
+        }
+        return selectedPath;
+      });
+      await LinuxPlatform.install();
+      const sink = PlatformTxtSink();
+      final result = await sink.saveText(fileName: '导出.txt', text: '正文\n日志 😀');
+      expect(result.path, file.path);
+      expect(result.isPublic, isTrue);
+      expect(await file.readAsString(), '正文\n日志 😀');
+      selectedPath = null;
+      await expectLater(
+        sink.saveText(fileName: '导出.txt', text: '取消后不得覆盖'),
+        throwsA(
+          isA<ExportWriteException>().having(
+            (e) => e.message,
+            'message',
+            '已取消保存',
+          ),
+        ),
+      );
+      expect(await file.readAsString(), '正文\n日志 😀');
+      unavailable = true;
+      await expectLater(
+        sink.saveText(fileName: '导出.txt', text: '失败'),
+        throwsA(
+          isA<ExportWriteException>().having(
+            (e) => e.message,
+            'message',
+            '选择器不可用',
+          ),
+        ),
+      );
+      unavailable = false;
+      selectedPath = directory.path;
+      await expectLater(
+        sink.saveText(fileName: '导出.txt', text: '不能写入目录'),
+        throwsA(isA<FileSystemException>()),
+      );
+      await expectLater(
+        const AppMethodChannel(
+          'fqapp/downloads',
+        ).invokeMethod<void>('deleteAll'),
+        throwsA(
+          isA<PlatformException>().having(
+            (e) => e.code,
+            'code',
+            'unsupported_platform',
+          ),
+        ),
+      );
     },
   );
 
