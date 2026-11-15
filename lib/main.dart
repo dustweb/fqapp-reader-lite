@@ -4,8 +4,7 @@ import 'services/native_player.dart';
 import 'services/desktop_platform.dart';
 import 'services/platform_channel.dart';
 
-import 'package:flutter/material.dart';
-import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
@@ -14,6 +13,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:hive_ce_flutter/hive_flutter.dart';
 
 import 'dart:async';
+
 import 'services/linux_platform.dart';
 
 import 'pages/home_page.dart';
@@ -293,7 +293,7 @@ class _FqAppState extends State<FqApp> {
   );
   // Desktop fullscreen reparents the content; keep the playback owner alive.
   final _audioScopeKey = GlobalKey();
-  final _navigatorKey = isWindowsDesktop
+  final _navigatorKey = isMediaDesktop
       ? DesktopPlatform.navigatorKey
       : GlobalKey<NavigatorState>();
   final _localDataReady = Completer<void>();
@@ -767,7 +767,7 @@ class _RootShellState extends State<RootShell> with TickerProviderStateMixin {
     ).push(MaterialPageRoute<void>(builder: (_) => const ThemePage()));
   }
 
-  Future<void> _retryWithDirectConnection() async {
+  Future<void> _resetProxyAndRetry() async {
     setState(() => _backendError = null);
     try {
       await NetworkProxyPreferences.instance.save(const NetworkProxyConfig());
@@ -831,10 +831,12 @@ class _RootShellState extends State<RootShell> with TickerProviderStateMixin {
                       onPressed: _startBackend,
                       child: const Text('重试'),
                     ),
-                    if (isWindowsDesktop)
+                    if (isWindowsDesktop || isLinuxDesktop)
                       TextButton(
-                        onPressed: _retryWithDirectConnection,
-                        child: const Text('重置代理为直连并重试'),
+                        onPressed: _resetProxyAndRetry,
+                        child: Text(
+                          isLinuxDesktop ? '重置代理为默认连接并重试' : '重置代理为直连并重试',
+                        ),
                       ),
                   ],
                 ],

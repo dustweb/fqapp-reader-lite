@@ -169,8 +169,9 @@ Linux/macOS 对应 `bash scripts/format_all.sh --since origin/master`，加 `--c
 
 | 工具 | 版本 | 用途 |
 |---|---|---|
-| Flutter | 3.44.6 (stable) | 构建 App |
-| Dart SDK | 3.12+ | 随 Flutter |
+| Flutter | 3.50.0 (stable) | 构建 App |
+| Dart SDK | 3.14.0 | 随 Flutter |
+| Android 构建工具链 | Gradle 9.5.0 / AGP 9.3.3 / Kotlin 2.4.20 | 构建 APK |
 | Rust | stable (cargo/rustc) | 编译原生核心 `fqapi_core` |
 | flutter_rust_bridge | 2.13.0 | 生成 Flutter/Rust 绑定 |
 | Android SDK | 36 (platform) + Build-Tools | 编译 APK |
@@ -178,6 +179,10 @@ Linux/macOS 对应 `bash scripts/format_all.sh --since origin/master`，加 `--c
 | Android NDK | 28.2.13676358 | 交叉编译 Rust ARM64 核心与 C 流式解密库 |
 | CMake | 3.22.1 | Android 构建自动编译 C 库 |
 | Visual Studio | 2022（「使用 C++ 的桌面开发」工作负载） | 仅构建 Windows 桌面端（可选） |
+
+> Flutter 3.50 已把 Material 与 Cupertino 拆到 `material_ui` / `cupertino_ui`。
+> 首方 Dart 源码统一导入这两个包；`package:flutter/material.dart` 和
+> `package:flutter/cupertino.dart` 已弃用，会让静态分析失败。
 
 > Windows 下构建注意：Kotlin 增量编译在部分环境会报 `Could not close incremental caches`，已在 `android/gradle.properties` 中关闭（`kotlin.incremental=false`）。
 
@@ -259,7 +264,7 @@ Rust 核心按 `arm64-v8a` 与 `armeabi-v7a` 两个 ABI 产出（`scripts/build_
 运行成功后，在该次运行的 **Artifacts** 中下载 `fqapp-arm64-运行编号`；其中包含
 `app-release.apk`、SHA-256、签名与 16 KiB 对齐报告、源码版本和工具版本，产物保留 14 天。
 
-[工作流](.github/workflows/android-apk.yml) 固定 Flutter `3.44.6`、Rust 工具链与
+[工作流](.github/workflows/android-apk.yml) 固定 Flutter `3.50.0`、Rust 工具链与
 flutter_rust_bridge `2.13.0`、JDK 17、NDK `28.2.13676358` 和 CMake `3.22.1`。
 Rust 核心与 C 解密库都会在 runner 上编译。CI 设置 `FQAPP_USE_MAVEN_MIRRORS=false`
 使用官方 Maven 源；本地构建默认仍使用国内镜像。
@@ -323,14 +328,13 @@ maven { url = uri("https://maven.aliyun.com/repository/public") }
 
 ### Gradle 发行版镜像
 
-若 `services.gradle.org` 下载慢，手动放入 `%USERPROFILE%\.gradle\wrapper\dists\gradle-9.1.0-all\<hash>\gradle-9.1.0-all.zip`（从腾讯云镜像 `https://mirrors.cloud.tencent.com/gradle/gradle-9.1.0-all.zip` 下载）。
+若 `services.gradle.org` 下载慢，手动放入 `%USERPROFILE%\.gradle\wrapper\dists\gradle-9.5.0-all\<hash>\gradle-9.5.0-all.zip`（从腾讯云镜像 `https://mirrors.cloud.tencent.com/gradle/gradle-9.5.0-all.zip` 下载）。
 
 ### 常见构建问题
 
 | 问题 | 解决 |
 |---|---|
 | `Could not close incremental caches` | 已在 `gradle.properties` 关闭 Kotlin 增量编译 |
-| 构建偶发 `IllegalStateException: The settings are not yet available for build` | Gradle 9.1.0 配置缓存推广处理器（`ConfigurationCachePromoHandler`）的偶发 bug，重跑即可恢复，无需修改配置（详见下方「已知问题与调试」） |
 | `Unable to locate Android SDK` | `flutter config --android-sdk C:\android-sdk` |
 | `Flutter requires Android SDK 36` | `sdkmanager "platforms;android-36"` |
 | maven.google.com 超时 | 已配置阿里云镜像 |
@@ -437,13 +441,12 @@ $serial = '127.0.0.1:16384' # 仅为已验证示例，必须按本次 info 输�
 
 官方参考：[ADB 连接说明](https://mumu.163.com/help/20240807/40912_1073151.html)、[MuMuManager 命令行说明](https://mumu.163.com/help/20240726/35047_1170006.html)。
 
-**本地 Flutter 工具链一致性**：`pubspec.lock` 与 CI（`FLUTTER_VERSION: '3.47.9'`）已升到 3.47.9，`.dart_tool/package_config.json` 也指向 `E:\ctf-aaa\.toolchains\flutter-3.47.9`；PATH 上的 `C:\Users\ch6vip\flutter\bin` 仍是 3.44.6 / Dart 3.12.2。混用会让 `flutter test` 报 `petitparser` 语言版本 3.13 过高及 `ui.HitTest*` 类型缺失；切到 3.47.9 后若出现 `Invalid kernel binary format version (expected 138, found 130)`，是 `.dart_tool/hooks_runner` 里旧 SDK 编译的 `hook.dill`，删除该生成目录即可，不必改动源码。
+**本地 Flutter 工具链一致性**：`pubspec.lock` 与 CI 使用 Flutter 3.50.0 / Dart 3.14.0；`pubspec.yaml` 保留 Dart 3.12.2 的兼容下限，使升级工具链不会顺带提高包语言版本。PATH 上的 `C:\Users\ch6vip\flutter\bin` 使用同一 Flutter 版本。切换 SDK 后若出现 kernel 版本冲突，删除 `.dart_tool/hooks_runner` 中旧 SDK 生成的缓存即可，不必修改源码。
 
 会话级临时指定（不修改全局 PATH）：
 
 ```powershell
-$env:PATH = 'E:\ctf-aaa\.toolchains\flutter-3.47.9\flutter\bin;' + $env:PATH
-Remove-Item -Recurse -Force .dart_tool\hooks_runner  # 仅在出现 kernel 版本冲突时
+flutter --version
 flutter analyze --no-pub
 bash scripts/test_quick.sh home
 ```
@@ -531,6 +534,14 @@ MuMu 实例 `0` / Android 12 / `127.0.0.1:16385` 已在公共修复包 `a9e68a0d
 这些记录证明界面、持久化与 Android 振动请求开关，不证明实体振动马达的触感或噪声；ARMv7 仅构建，未在设备上运行；视频倍速与听书定位的具体播放路径未实操。最终进程的 logcat 未见匹配的崩溃或振动通道初始化错误。iOS 构建与物理设备性能未验证。
 
 ### 分层跑测试
+
+#### 经典阅读器：书旗自动缓存与来源契约（PR #348）
+
+书旗正文阅读与全文搜索保留自动加密章节缓存，缓存键使用 `shuqi:<原始数字 ID>`，与番茄相同数字 ID 隔离。这是对下文 #270「不写章节缓存」历史行为的有意调整；书旗仍不写阅读历史或阅读时长，也不开放番茄的评论、音视频、手动下载和分享入口。`ReaderPage.localOnly` 表示禁用这些番茄在线能力，不再代表禁止全部磁盘缓存，来源必须独立判断。本地 TXT/EPUB 导入书仍读本地文件，不进入远程章节缓存。
+
+缓存管理必须保留来源：书旗缓存可查看、删除和重开；重开使用 `source=shuqi` 和原始数字书架 ID，缺章及导出只允许使用书旗加载器，禁止把 `shuqi:` ID 交给番茄目录、正文、详情、作者或链接分享。已有目录结构不增加新身份格式；书架仍遵守 #270 的 `ShelfIdentity` 规则。自动缓存沿用既有容量、淘汰与加密策略，缓存缺失不伪装为已有完整下载。
+
+全文搜索在显示文本上逐章串行扫描；已有缓存跳过网络，未缓存请求至少间隔 300ms，可停止或改词取消后续工作。摘要上限仅限制展示，不截断扫描或总匹配统计。经典 AI 入口按有效章节视图显示；档案 AI 策略另行处理。书籍面板保留下滑、遮罩和系统返回关闭，不另设可见关闭按钮。
 
 #### 2026-11-10 书旗书架来源修复（#270）
 
@@ -995,6 +1006,28 @@ App 通过 `ApiClient` 调用后端 **`/api/v1/*` 业务路由**（Rust 核心 `
 （`catalog` 形态竖屏、feed 卡片、通用播放器）视频设置里保留一行入口（行尾当前档，
 点开同一个弹层）；分屏紧凑条已有当前档，不再重复给入口。
 
+取流响应的 `variants[].width` / `height` 是原始像素尺寸，
+`variants[].quality_height` 是画质短边，播放选档、下载上限与自动缓存共用后者。
+竖屏 `720×1280` 对应 `720P`，下载上限 `720` 会选择这一档。缺少短边元数据时
+保持画质未知；默认流的画质可在解码宽、高都已知后取短边，不能单凭像素高度推断。
+旧下载偏好一次迁到 `drama_download_max_quality_height`，成功写入后移除旧键；
+已有缓存与断点记录保留文件、原始高度和流身份，并优先从原档位名称恢复短边。
+
+后端三路取流仍使用绝对请求预算与首个成功后的完成宽限。每次请求保留已经收到的
+模型响应，并复用同次请求中成功可用的 `fallback_api` 响应补齐档位；没有赶在预算内
+返回的源仍可能缺档。规范化响应的 `source_trace_id` 可关联 Rust 的 `stream trace` 与
+Dart 的 `player-quality` 日志，比较同一次加载的档位数、短边与主流是否在列表中；
+旧格式原始响应完整透传，诊断编号只写 Rust 日志。这些诊断不记录播放地址或内容密钥。
+多个源提供同名档位时，精确匹配实际主流地址的行优先保留；
+同一播放地址只展示一档，拒绝的别名不占用后续真实流的档位名称。
+
+2026-11-15 在 MuMu 6.8.8 / Android 12 / 实例 0 的实际上游路径中，横屏和竖屏
+样本均显示 1080P、720P、540P、480P、360P，Rust 与 Dart 同次请求记录的档位数一致。
+下载上限 720 的文件实际为横屏 1280×720、竖屏 720×1280，重开均从离线文件出首帧；
+旧偏好 1280 迁为 720，已有 68 个缓存文件逐文件哈希保持一致。实际 dispatcher 的
+本地响应对照确认已返回模型在取消后保留、成功 fallback 只请求一次，以及同 URL
+不同档位只保留一行。MuMu 使用 ARM 转译，这些结果不证明真机解码性能。
+
 **横屏「下一集」卡**（`video_player_chrome.dart` 的 `_nextEpisodeCard`）：
 
 - **16:9 为理想比例**；封面按「3 倍卡高」铺进去并上移一个卡高，窗口里只露出封面中间 **1/3**。
@@ -1120,26 +1153,7 @@ curl http://127.0.0.1:18080/health
 ### 3. 设备池过期
 若 content/full 解密乱码，删除 `files/backend/config/device_pool.json` 重启 App 即可自动重注册。
 
-### 4. 构建偶发 `The settings are not yet available for build`
-
-**现象**：`flutter build` / `gradlew` 偶发报
-`IllegalStateException: The settings are not yet available for build`，
-但重跑即恢复（daemon 日志显示失败后紧接着的 daemon 几秒内成功）。
-
-**根因**（已定位到 Gradle 9.1.0 字节码）：调用链为
-`ConfigurationCachePromoHandler.beforeComplete()` →
-`runWithoutBuildDefinition()` → `ResolvedBuildLayout.isBuildDefinitionMissing()` →
-`DefaultGradle.getSettings()`。`getSettings()` 在 settings 尚未 attach 时直接抛异常；
-该处理器是 Gradle 9.1.0 新增的「配置缓存推广」功能（构建结束时打印
-`Consider enabling configuration cache`），在复合构建（`settings.gradle.kts` 中
-`includeBuild(flutter_tools)` + 子工程 `:gradle`）首次初始化的时序里偶发踩中此状态。
-
-**结论**：这是 Gradle 9.1.0 自身缺陷，非项目代码问题，且无法稳定复现。
-
-**处理**：无需修改代码/配置；偶发时重跑即可。若想彻底规避，可升级 Gradle
-补丁版本（9.1.x / 9.2，需先确认与 AGP 9.0.1 兼容）。
-
-> 注意：`Daemon compilation failed`（Kotlin 2.3.20，见
+> 注意：`Daemon compilation failed`（Kotlin 2.4.20，见
 > `android/.kotlin/errors/*.log`）是另一独立问题 —— Kotlin 编译守护进程崩溃，
 > 已通过 `gradle.properties` 的 `kotlin.incremental=false` 与
 > `kotlin.compiler.execution.strategy=in-process` 规避，勿因 AGP 9 弃用警告而删除这些配置。
@@ -1227,7 +1241,7 @@ WebDAV 配置与诊断由数据同步功能负责。
 第四批提供实验性 Arch 打包脚本与 Linux CI artifact，不提供正式 Release。
 构建溯源、安装/卸载、升级回退边界与依赖见 [LINUX.md](LINUX.md)。
 
-Arch 构建依赖：Flutter stable（本批验证 3.47.9 / Dart 3.13.7）、Rust stable
+Arch 构建依赖：Flutter stable（目标工具链 3.50.0 / Dart 3.14.0）、Rust stable
 及 x86_64-unknown-linux-gnu target、clang、cmake、ninja、pkgconf、gtk3、libsecret。
 运行需要 GTK3、libsecret、glibc（含 iconv）、xdg-user-dirs 和图形会话，
 以及已启动且已解锁的 Secret Service（如 GNOME Keyring）。不要用 sudo 运行应用。

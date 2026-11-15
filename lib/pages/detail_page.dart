@@ -2,8 +2,8 @@ import '../widgets/desktop_chapter_sidebar.dart';
 import '../services/desktop_platform.dart';
 import 'dart:async';
 
-import 'package:flutter/cupertino.dart';
-import 'package:flutter/material.dart';
+import 'package:cupertino_ui/cupertino_ui.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 
@@ -410,7 +410,7 @@ class _DetailPageState extends State<DetailPage> {
         _isVideo &&
         widget.detailLoader == null &&
         widget.directoryLoader == null &&
-        !(await (widget.connectivity ?? currentConnectivity)()).online;
+        await videoNetworkIsOffline(probe: widget.connectivity);
     if (!mounted || generation != _loadGeneration) return;
 
     // Detail and directory are independent. Short-drama IDs sometimes do
@@ -1931,6 +1931,7 @@ class _DetailPageState extends State<DetailPage> {
         shelfItem: widget.item,
       ),
       _ => ReaderPage(
+        bookDetail: _bookDetail,
         bookId: _contentId,
         title: widget.item.title,
         cover: widget.item.cover,

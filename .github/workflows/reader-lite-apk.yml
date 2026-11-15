@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FLUTTER_VERSION: '3.47.9'
+  FLUTTER_VERSION: '3.50.0'
   NDK_VERSION: '28.2.13676358'
   EXPECTED_SIGNER_SHA256: 'f9875fede094af89abe163c14090ca5b27b8817e1dc30cfd9669a43e00ac3807'
   FQAPP_USE_MAVEN_MIRRORS: 'false'

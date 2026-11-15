@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      FLUTTER_VERSION: '3.47.9'
+      FLUTTER_VERSION: '3.50.0'
       NDK_VERSION: '28.2.13676358'
       FQAPP_USE_MAVEN_MIRRORS: 'false'
       CARGO_BUILD_JOBS: '2'
