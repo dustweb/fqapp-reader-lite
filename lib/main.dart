@@ -5,6 +5,8 @@ import 'services/desktop_platform.dart';
 import 'services/platform_channel.dart';
 
 import 'package:material_ui/material_ui.dart';
+import 'package:flutter/foundation.dart'
+    show LicenseRegistry, LicenseEntryWithLineBreaks;
 import 'package:flutter/services.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
@@ -17,6 +19,7 @@ import 'dart:async';
 import 'services/linux_platform.dart';
 
 import 'pages/home_page.dart';
+import 'pages/api_service_page.dart';
 import 'pages/audio_page.dart';
 import 'pages/cached_books_page.dart';
 import 'pages/drama_page.dart';
@@ -28,8 +31,11 @@ import 'services/frame_stats.dart';
 import 'services/shell_visibility.dart';
 import 'services/app_theme.dart';
 import 'services/app_theme_style.dart';
+import 'services/appearance_prewarm.dart';
+import 'services/app_style_tokens.dart';
 import 'services/api_client.dart';
 import 'services/ai_reading/ai_controller.dart';
+import 'services/sync/multi_device_sync_service.dart';
 import 'services/webdav_sync_service.dart';
 import 'services/audio_download_store.dart';
 import 'services/audio_floating_routes.dart';
@@ -64,6 +70,8 @@ import 'widgets/app_ui/app_ui_scope.dart';
 import 'widgets/dock_auto_hide.dart';
 import 'widgets/shell_dock.dart';
 import 'widgets/home/home_design.dart';
+import 'widgets/home/home_skeleton.dart';
+import 'widgets/home/classic_home_skeleton.dart';
 
 Future<void> main() async {
   // 绑定初始化与 runApp 必须处在同一个 Zone：此前 `ensureInitialized` 在
@@ -79,6 +87,13 @@ Future<void> main() async {
     } catch (error, stack) {
       AppLog.e('main', '启动装配失败，继续挂载界面', error: error, stack: stack);
     }
+    // 首帧主题：本地数据还没读完就画骨架，会让「系统浅色 + 应用内强制深色 /
+    // 墨水屏」的用户先闪一整屏浅色。外观偏好只有几个键，读它比整包本地数据
+    // 快得多，所以先单独预热一次，再进 runApp。
+    //
+    // 但这条 I/O 走平台通道，不能无上限地挡住 runApp：超时就用默认值启动，
+    // `_loadLocalData` 后面还会再读一次并纠正。
+    await primeWithBudget(const Duration(milliseconds: 300));
     runApp(const ProviderScope(child: FqApp()));
   }, (error, stack) => AppLog.e('zone', '未捕获异步异常', error: error, stack: stack));
 }
@@ -87,6 +102,11 @@ Future<void> main() async {
 /// 这些都不决定界面能不能起来，所以失败只记日志（见 [main]）。
 Future<void> _prepareRuntime() async {
   registerPortedUiLicenses();
+  LicenseRegistry.addLicense(() async* {
+    yield LicenseEntryWithLineBreaks(const [
+      'sync_storage',
+    ], await rootBundle.loadString('assets/licenses/sync_storage.txt'));
+  });
   if (isLinuxDesktop) await LinuxPlatform.install();
   if (isWindowsDesktop) await DesktopPlatform.instance.initialize();
   // 应用内日志：接管 debugPrint 与 FlutterError.onError，未处理异步异常由
@@ -127,6 +147,7 @@ Future<void> _prepareRuntime() async {
           } catch (error, stack) {
             AppLog.w('exit', '退出前停止后端失败', error: error, stack: stack);
           }
+          await MultiDeviceSyncService.instance.shutdown();
           await Hive.close();
         };
   }
@@ -152,6 +173,12 @@ Future<void> _loadLocalData() async {
       AppLog.w('startup', '可选本地数据初始化失败，已跳过', error: error, stack: stack);
     }
   }
+
+  // SharedPreferences 与主题样式原本串在并行段之后：闸门要等它们依次返回，
+  // 冷启动因此多出两轮顺序 I/O。并入并行段后，闸门时长从「两段串行」变成
+  // 「取最慢的一段」——等待感来自最慢的那项，不是项数之和（#318）。
+  final spFuture = SharedPreferences.getInstance();
+  final themeStyleFuture = AppThemeStyleStore.instance.load();
 
   await Future.wait<void>([
     // Load before interactive pages mount, so a saved opt-out applies at launch.
@@ -206,9 +233,19 @@ Future<void> _loadLocalData() async {
     optional(HiveAudioDownloadStore.instance.warmUp),
     // AI 设置/缓存/反馈箱：失败只让 AI 功能退化，不能拖住阅读。
     optional(AiReadingController.instance.init),
+    // 主题样式与 SharedPreferences 一并并行：两者都是启动链上的必要项，
+    // 但都不该排在并行段之后串行等。
+    spFuture.then<void>((_) {}),
+    themeStyleFuture,
   ]);
-  // WebDAV 为可选功能；网络或安全存储故障不阻塞本机阅读。
-  unawaited(optional(WebDavSyncService.instance.init));
+  // 多端同步的网络或安全存储故障不阻塞本机阅读。
+  unawaited(
+    optional(() async {
+      final sync = MultiDeviceSyncService.instance;
+      await sync.initialize();
+      if (!sync.hasSelectedSyncBackend) await WebDavSyncService.instance.init();
+    }),
+  );
   // 听书后台播放开关：异步读取 SharedPreferences，失败退化为默认开启。
   unawaited(AudioPreferences.instance.load());
   // 短剧「边看边往后缓存」的开关与集数：同一条装配链里读，避免播放页
@@ -240,8 +277,7 @@ Future<void> _loadLocalData() async {
   // 小米澎湃 OS 公平运行内存：注册 TRIM/KILL 通道回调。必须在启动时构造，
   // 否则广播到达时 Dart 侧还没有处理函数，原生侧只能按“未处理”回。
   FairMemoryService.instance.init();
-  final sp = await SharedPreferences.getInstance();
-  await AppThemeStyleStore.instance.load();
+  final sp = await spFuture;
   // Note: Optional preference schemas cannot block local data startup; see
   // .agents/notes/implemented/bug-fix/2026-09-17-persistent-data-and-web-cancellation.md.
   final savedTheme = sp.get(themeModeKey);
@@ -501,24 +537,21 @@ class _AppBootstrapState extends State<AppBootstrap> {
   @override
   Widget build(BuildContext context) {
     if (_ready) return widget.child;
-    return Scaffold(
-      body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (_failed)
+    if (_failed) {
+      return Scaffold(
+        body: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
                   Icon(
                     LucideIcons.triangle_alert,
                     color: Theme.of(context).colorScheme.error,
-                  )
-                else
-                  const CircularProgressIndicator(),
-                const SizedBox(height: 16),
-                Text(_failed ? '无法读取本地数据' : '正在读取本地数据…'),
-                if (_failed) ...[
+                  ),
+                  const SizedBox(height: 16),
+                  const Text('无法读取本地数据'),
                   const SizedBox(height: 8),
                   const Text('请检查设备可用空间后重试。', textAlign: TextAlign.center),
                   const SizedBox(height: 16),
@@ -527,6 +560,42 @@ class _AppBootstrapState extends State<AppBootstrap> {
                     child: const Text('重试'),
                   ),
                 ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    // 成功路径不再整屏「转圈 + 文案」：本地数据就绪前用首页骨架占住版式。
+    // 骨架屏的价值正是让真卡片落位时不跳，而一句「正在读取本地数据…」配
+    // 转圈只会让人读成应用卡住。提示语留给失败路径——那一屏必须说清
+    // 「没读到」并给出重试（#318）。
+    return Scaffold(
+      body: SafeArea(
+        child: Semantics(
+          // 骨架是纯形状，读屏用户拿不到任何加载提示：旧实现有一句
+          // 「正在读取本地数据…」，这里把它降级成无障碍标签——文案不再占屏，
+          // 但状态仍然说得出。
+          label: '正在读取本地数据…',
+          liveRegion: true,
+          child: ExcludeSemantics(
+            child: CustomScrollView(
+              // 滚动物理跟真实首页一致，否则骨架 → 首页时手感会变一次。
+              physics: const BouncingScrollPhysics(
+                parent: AlwaysScrollableScrollPhysics(),
+              ),
+              slivers: [
+                SliverToBoxAdapter(
+                  // 骨架自带的脉动保留：它在说「还在加载」，而不是界面卡住。
+                  //
+                  // 代价是「本地数据未就绪」态没有静止的一帧——测试里不能靠
+                  // `pumpAndSettle()` 等它停下来（会卡到超时），要用有界推进
+                  // 推到目标出现为止（见 test/startup_gate_test.dart 的
+                  // pumpUntilFound）。
+                  child: AppStyleTokens.of(context).isClassic
+                      ? const ClassicHomeSkeleton()
+                      : const HomeSkeleton(),
+                ),
               ],
             ),
           ),
@@ -547,7 +616,6 @@ class RootShell extends StatefulWidget {
 
 class _RootShellState extends State<RootShell> with TickerProviderStateMixin {
   int _index = 0;
-  bool _backendReady = false;
   bool _legacyNoticeScheduled = false;
 
   /// 页面滑动过渡动画：dock 点击 / 拖动松手 / 页面回调统一经 [_selectTab]
@@ -771,10 +839,8 @@ class _RootShellState extends State<RootShell> with TickerProviderStateMixin {
     });
     try {
       await (widget.backendStarter ?? BackendService.instance.start)();
-      if (mounted) {
-        setState(() => _backendReady = true);
-        _scheduleLegacyUiNotice();
-      }
+      // 成功路径不再有整屏闸门，界面不需要为此重建；只有失败才要换屏。
+      if (mounted) _scheduleLegacyUiNotice();
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -846,64 +912,13 @@ class _RootShellState extends State<RootShell> with TickerProviderStateMixin {
 
   @override
   Widget build(BuildContext context) {
-    if (!_backendReady) {
-      return Scaffold(
-        body: SafeArea(
-          child: Center(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.symmetric(vertical: 24),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (_backendError == null)
-                    const CircularProgressIndicator()
-                  else
-                    Icon(
-                      LucideIcons.triangle_alert,
-                      color: Theme.of(context).colorScheme.error,
-                    ),
-                  const SizedBox(height: 16),
-                  Text(_backendError == null ? '正在启动本地服务...' : '启动失败'),
-                  TextButton.icon(
-                    onPressed: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => const CachedBooksPage(),
-                      ),
-                    ),
-                    icon: const Icon(LucideIcons.download),
-                    label: const Text('离线阅读'),
-                  ),
-                  if (_backendError != null) ...[
-                    const SizedBox(height: 8),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 24),
-                      child: Text(
-                        _backendError!,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(fontSize: 12, color: Colors.red),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    OutlinedButton(
-                      onPressed: _startBackend,
-                      child: const Text('重试'),
-                    ),
-                    if (isWindowsDesktop || isLinuxDesktop)
-                      TextButton(
-                        onPressed: _resetProxyAndRetry,
-                        child: Text(
-                          isLinuxDesktop ? '重置代理为默认连接并重试' : '重置代理为直连并重试',
-                        ),
-                      ),
-                  ],
-                ],
-              ),
-            ),
-          ),
-        ),
-      );
-    }
+    // 后端起不来时保留整屏错误页：原因、重试与服务面板入口都必须在。
+    // 本地服务没起来时用户仍要能进离线阅读、查服务面板、或重置代理再试
+    // （#318 只动成功路径的等待提示）。
+    if (_backendError != null) return _backendFailureView(context);
+    // 成功路径不再整屏遮罩：壳层与首页立刻出现，本地服务在后台静默启动，
+    // 等待反馈交给首页自己的骨架。核心就绪后数据直接落位，用户无需重试
+    // （传输层会把启动期间的请求排队到核心就绪为止）。
     if (isWindowsDesktop) {
       return ValueListenableBuilder<int>(
         valueListenable: desktopTab,
@@ -1018,6 +1033,69 @@ class _RootShellState extends State<RootShell> with TickerProviderStateMixin {
           overVideo: false,
           staticMaterial: shellDockStaticMaterial(overVideo: false),
           animating: _pageMotion.isAnimating,
+        ),
+      ),
+    );
+  }
+
+  /// 后端启动失败时的整屏错误页。
+  ///
+  /// 失败路径必须说清原因并留下重试与服务面板入口：本地服务没起来时，用户
+  /// 仍要能进离线阅读、查服务面板、或重置代理后再试。成功路径不再显示这层
+  /// 整屏提示（#318），所以这里是唯一还会整屏接管的地方。
+  Widget _backendFailureView(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(vertical: 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  LucideIcons.triangle_alert,
+                  color: Theme.of(context).colorScheme.error,
+                ),
+                const SizedBox(height: 16),
+                const Text('启动失败'),
+                TextButton.icon(
+                  onPressed: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const CachedBooksPage()),
+                  ),
+                  icon: const Icon(LucideIcons.download),
+                  label: const Text('离线阅读'),
+                ),
+                const SizedBox(height: 8),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: Text(
+                    _backendError ?? '',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(fontSize: 12, color: Colors.red),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                OutlinedButton(
+                  onPressed: _startBackend,
+                  child: const Text('重试'),
+                ),
+                TextButton.icon(
+                  onPressed: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const ApiServicePage()),
+                  ),
+                  icon: const Icon(LucideIcons.settings),
+                  label: const Text('服务面板'),
+                ),
+                if (isWindowsDesktop || isLinuxDesktop)
+                  TextButton(
+                    onPressed: _resetProxyAndRetry,
+                    child: Text(isLinuxDesktop ? '重置代理为默认连接并重试' : '重置代理为直连并重试'),
+                  ),
+              ],
+            ),
+          ),
         ),
       ),
     );
