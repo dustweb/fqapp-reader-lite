@@ -1,12 +1,15 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 
 import '../models/rank.dart';
 import '../services/api_client.dart';
+import '../services/desktop_platform.dart';
 import '../services/rank_cache.dart';
 import '../services/user_facing_error.dart';
+import '../widgets/desktop_shell_scope.dart';
 import '../widgets/home/home_back_button.dart';
 import '../widgets/home/home_chip.dart';
 import '../widgets/home/home_design.dart';
@@ -111,7 +114,9 @@ class _RankPageState extends State<RankPage> {
     // The lite app keeps only book and audio rankings.
     catalog = RankCatalog(
       rankId: catalog.rankId,
-      tabs: catalog.tabs.where((tab) => !tab.isDrama && !tab.name.contains('漫画')).toList(),
+      tabs: catalog.tabs
+          .where((tab) => !tab.isDrama && !tab.name.contains('漫画'))
+          .toList(),
       categories: catalog.categories,
     );
     if (catalog.tabs.isEmpty) {
@@ -263,13 +268,17 @@ class _RankPageState extends State<RankPage> {
   @override
   Widget build(BuildContext context) {
     final palette = HomePalette.of(context);
+    final inDesktopFrame =
+        isWindowsDesktop && DesktopShellScope.hasFrameOf(context);
     return Scaffold(
       backgroundColor: palette.canvas,
       appBar: AppBar(
         backgroundColor: palette.canvas,
         surfaceTintColor: Colors.transparent,
         scrolledUnderElevation: 0,
-        leading: const HomeBackButton(),
+        automaticallyImplyLeading: false,
+        leading: inDesktopFrame ? null : const HomeBackButton(),
+        titleSpacing: inDesktopFrame ? homeGutter : null,
         title: Text(
           '排行榜',
           style: TextStyle(
@@ -282,7 +291,7 @@ class _RankPageState extends State<RankPage> {
       body: Align(
         alignment: Alignment.topCenter,
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 840),
+          constraints: BoxConstraints(maxWidth: isWindowsDesktop ? 1240 : 840),
           child: Column(
             children: [
               if (_catalog.tabs.isNotEmpty)
@@ -352,6 +361,7 @@ class _RankPageState extends State<RankPage> {
       );
     }
     final hasFooter = _loadingMore || _loadMoreError != null || !_page.hasMore;
+    final palette = HomePalette.of(context);
     return NotificationListener<ScrollNotification>(
       onNotification: (notification) {
         final metrics = notification.metrics;
@@ -361,23 +371,76 @@ class _RankPageState extends State<RankPage> {
         }
         return false;
       },
-      child: ListView.builder(
-        key: const Key('rank_list'),
-        padding: EdgeInsets.fromLTRB(
-          homeGutter,
-          4,
-          homeGutter,
-          // 没有流尾时由列表自己吃掉底部安全区；有流尾时交给流尾。
-          hasFooter ? 0 : 24 + MediaQuery.paddingOf(context).bottom,
-        ),
-        itemCount: _page.entries.length + (hasFooter ? 1 : 0),
-        itemBuilder: (context, index) {
-          if (index >= _page.entries.length) {
-            return _footer();
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          if (isWindowsDesktop && constraints.maxWidth >= 880) {
+            final scaler = MediaQuery.textScalerOf(context);
+            final rowExtent = math.max(
+              108.0,
+              scaler.scale(15) * 2.7 +
+                  scaler.scale(11.5) * 1.4 +
+                  scaler.scale(12) * 3.2 +
+                  40.0,
+            );
+            return CustomScrollView(
+              key: const Key('rank_list'),
+              slivers: [
+                SliverPadding(
+                  padding: EdgeInsets.fromLTRB(
+                    homeGutter,
+                    8,
+                    homeGutter,
+                    hasFooter ? 0 : 24 + MediaQuery.paddingOf(context).bottom,
+                  ),
+                  sliver: SliverGrid(
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 2,
+                      crossAxisSpacing: 14,
+                      mainAxisSpacing: 12,
+                      mainAxisExtent: rowExtent,
+                    ),
+                    delegate: SliverChildBuilderDelegate((context, index) {
+                      final entry = _page.entries[index];
+                      return DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: palette.surface,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: palette.line),
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          child: _RankRow(
+                            entry: entry,
+                            onTap: () => _openEntry(entry),
+                          ),
+                        ),
+                      );
+                    }, childCount: _page.entries.length),
+                  ),
+                ),
+                if (hasFooter) SliverToBoxAdapter(child: _footer()),
+              ],
+            );
           }
-          return _RankRow(
-            entry: _page.entries[index],
-            onTap: () => _openEntry(_page.entries[index]),
+          return ListView.builder(
+            key: const Key('rank_list'),
+            padding: EdgeInsets.fromLTRB(
+              homeGutter,
+              4,
+              homeGutter,
+              // 没有流尾时由列表自己吃掉底部安全区；有流尾时交给流尾。
+              hasFooter ? 0 : 24 + MediaQuery.paddingOf(context).bottom,
+            ),
+            itemCount: _page.entries.length + (hasFooter ? 1 : 0),
+            itemBuilder: (context, index) {
+              if (index >= _page.entries.length) {
+                return _footer();
+              }
+              return _RankRow(
+                entry: _page.entries[index],
+                onTap: () => _openEntry(_page.entries[index]),
+              );
+            },
           );
         },
       ),
