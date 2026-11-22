@@ -1,6 +1,11 @@
 name: Check upstream updates
 
 on:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/reader-lite-upstream.yml
   schedule:
     - cron: '17 3 * * *'
   workflow_dispatch:
@@ -21,37 +26,82 @@ jobs:
         with:
           ref: master
           fetch-depth: 0
-      - name: Prepare upstream merge for review
+      - name: Prepare upstream changes without replacing fork workflows
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
           git fetch --no-tags https://github.com/ch6vip/fqapp.git master
-          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+          upstream_full_sha=$(git rev-parse FETCH_HEAD)
+          upstream_sha=$(git rev-parse --short=12 FETCH_HEAD)
+          tracking_file='.github/reader-lite-upstream.sha'
+          recorded_sha=''
+          if [[ -f "$tracking_file" ]]; then
+            recorded_sha=$(tr -d '\r\n' < "$tracking_file")
+          fi
+
+          if [[ "$recorded_sha" == "$upstream_full_sha" ]]; then
+            echo 'Already synchronized with this upstream revision.'
+            exit 0
+          fi
+          if [[ -z "$recorded_sha" ]] && git merge-base --is-ancestor FETCH_HEAD HEAD; then
             echo 'Already up to date.'
             exit 0
           fi
-          upstream_sha=$(git rev-parse --short=12 FETCH_HEAD)
+          if [[ -n "$recorded_sha" ]]; then
+            if ! git cat-file -e "$recorded_sha^{commit}"; then
+              echo '::error::Recorded upstream commit is not available.'
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$recorded_sha" FETCH_HEAD; then
+              echo '::error::Upstream history changed; review the synchronization base.'
+              exit 1
+            fi
+          fi
+
           branch="sync/upstream-$upstream_sha"
           if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
             echo "Update branch already exists: $branch"
           else
             git switch -c "$branch"
-            if ! git merge --no-edit --no-ff FETCH_HEAD; then
-              git merge --abort
-              echo '::error::Upstream changes conflict with the lite version; a manual merge is required.'
-              exit 1
+            if [[ -n "$recorded_sha" ]]; then
+              # Once an upstream revision was squashed, apply only the new commits.
+              git diff --binary "$recorded_sha" FETCH_HEAD -- . ':(exclude).github/workflows/**' > "$RUNNER_TEMP/upstream.patch"
+              if ! git apply --3way --index "$RUNNER_TEMP/upstream.patch"; then
+                git reset --hard HEAD
+                echo '::error::Upstream changes conflict with the lite version; review is required.'
+                exit 1
+              fi
+            else
+              # A squash commit avoids pushing upstream workflow-modifying commits.
+              if ! git merge --squash FETCH_HEAD; then
+                git reset --hard HEAD
+                echo '::error::Upstream changes conflict with the lite version; review is required.'
+                exit 1
+              fi
+              # Keep the fork's build, release and synchronization workflows intact.
+              git restore --source=HEAD --staged --worktree -- .github/workflows
+              git clean -fd -- .github/workflows
             fi
+            printf '%s\n' "$upstream_full_sha" > "$tracking_file"
+            git add -- "$tracking_file"
+            if git diff --cached --quiet; then
+              echo 'No source changes to synchronize.'
+              exit 0
+            fi
+            git commit -m "Sync upstream $upstream_sha (preserve Reader Lite workflows)"
             git push origin "$branch"
           fi
+
           compare_url="https://github.com/$GITHUB_REPOSITORY/compare/master...$branch?expand=1"
           echo "上游更新分支：[$branch]($compare_url)" >> "$GITHUB_STEP_SUMMARY"
           if gh pr view "$branch" --json number >/dev/null 2>&1; then
             echo 'A pull request already exists.'
           elif ! gh pr create --base master --head "$branch" \
             --title "同步上游更新 ($upstream_sha)" \
-            --body '此更新合并了上游 master。请检查精简界面、阅读和听书功能，再合并；如有冲突请手动处理。'; then
+            --body '以压缩提交同步上游应用代码并跟踪上游版本，保留本仓库的 GitHub Actions 工作流。请检查精简界面、阅读与听书功能，再合并。'; then
             echo '::warning::Automatic pull request creation is unavailable. Open the compare link in the workflow summary to create it manually.'
           fi
