@@ -29,6 +29,10 @@ pub(crate) const EMPTY_ROTATE_ROUNDS: u32 = 2;
 
 /// The v5 signed player door (single host, the one the app ships).
 pub(crate) const V5_PLAYER_HOST: &str = "https://api5-normal-sinfonlinea.fqnovel.com";
+pub(crate) const VIDEO_MODEL_HOSTS: [&str; 2] = [
+    "https://api5-normal-sinfonlinea.fqnovel.com",
+    "https://api5-normal-sinfonlinec.fqnovel.com",
+];
 /// The signed `GET video_tab` fallback door.
 ///
 /// The `hl`/`lf` hosts were dropped: on-device sampling showed every host
@@ -38,8 +42,14 @@ pub(crate) const VIDEO_TAB_HOSTS: [&str; 1] = ["https://api5-normal-sinfonlineb.
 /// Which upstream door a route addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Door {
+    /// The enhanced anonymous V5 door registered with the mini-reel device
+    /// profile and signed with the full Medusa/Gorgon envelope.
+    AnonymousV5,
     /// `POST /novel/player/multi_video_model/player/v1` with the v5 signature.
     V5Player,
+    /// `POST /novel/player/video_model/v1/`, the official single-episode door,
+    /// also signed with the v5 player envelope.
+    VideoModel,
     /// `GET /reading/bookapi/video_tab/multi_video_model/v1/` signed with the
     /// regular request signer; the official app keeps this path.
     VideoTab,
@@ -56,7 +66,12 @@ pub(crate) struct Route {
 impl Route {
     pub fn host(self) -> &'static str {
         match self.door {
+            Door::AnonymousV5 => V5_PLAYER_HOST,
             Door::V5Player => V5_PLAYER_HOST,
+            Door::VideoModel => VIDEO_MODEL_HOSTS
+                .get(self.host_index as usize)
+                .copied()
+                .unwrap_or(VIDEO_MODEL_HOSTS[0]),
             Door::VideoTab => VIDEO_TAB_HOSTS
                 .get(self.host_index as usize)
                 .copied()
@@ -67,7 +82,10 @@ impl Route {
     /// Short label for diagnostics; hosts themselves are not logged.
     pub fn tag(self) -> &'static str {
         match self.door {
+            Door::AnonymousV5 => "anon",
             Door::V5Player => "v5",
+            Door::VideoModel if self.host_index == 1 => "model-c",
+            Door::VideoModel => "model-a",
             Door::VideoTab => "tab-b",
         }
     }
@@ -75,10 +93,20 @@ impl Route {
 
 /// Every route the playback chain may use, in preference order.
 pub(crate) fn routes() -> Vec<Route> {
-    let mut all = vec![Route {
-        door: Door::V5Player,
-        host_index: 0,
-    }];
+    let mut all = vec![
+        Route {
+            door: Door::AnonymousV5,
+            host_index: 0,
+        },
+        Route {
+            door: Door::V5Player,
+            host_index: 0,
+        },
+    ];
+    all.extend((0..VIDEO_MODEL_HOSTS.len()).map(|index| Route {
+        door: Door::VideoModel,
+        host_index: index as u8,
+    }));
     all.extend((0..VIDEO_TAB_HOSTS.len()).map(|index| Route {
         door: Door::VideoTab,
         host_index: index as u8,
@@ -124,13 +152,9 @@ impl PlaybackRouteState {
             return available.into_iter().take(1).collect();
         }
         if available.is_empty() {
-            // Everything is cooling down: probe the earliest recovery only.
-            return all
-                .iter()
-                .copied()
-                .min_by_key(|route| self.health_for(*route).blocked_until_ms)
-                .map(|route| vec![route])
-                .unwrap_or_default();
+            let mut cooling = all;
+            cooling.sort_by_key(|route| self.health_for(*route).blocked_until_ms);
+            return cooling;
         }
         available
     }
@@ -297,9 +321,27 @@ mod tests {
             state.failed(route, 0, true);
         }
         assert!(state.plan(1, true).is_empty());
-        // Foreground still gets one earliest-recovery probe.
-        assert_eq!(state.plan(1, false).len(), 1);
+        let cooling = state.plan(1, false);
+        assert_eq!(cooling.len(), routes().len());
+        assert_eq!(cooling, routes());
         assert!(state.exhausted(1));
+    }
+
+    #[test]
+    fn a_foreground_plan_orders_cooling_doors_by_recovery_time() {
+        let mut state = PlaybackRouteState::default();
+        let all = routes();
+        for (index, route) in all.iter().enumerate() {
+            let failed_at = if index == all.len() - 1 {
+                0
+            } else {
+                5_000 + index as u64 * 1_000
+            };
+            state.failed(*route, failed_at, true);
+        }
+        let mut expected = vec![*all.last().unwrap()];
+        expected.extend_from_slice(&all[..all.len() - 1]);
+        assert_eq!(state.plan(8_000, false), expected);
     }
 
     #[test]
@@ -373,7 +415,8 @@ mod tests {
     #[test]
     fn route_tags_stay_short_and_address_free() {
         let tags: Vec<&str> = routes().iter().map(|route| route.tag()).collect();
-        assert_eq!(tags, vec!["v5", "tab-b"]);
+        assert_eq!(tags, vec!["anon", "v5", "model-a", "model-c", "tab-b"]);
+        assert_ne!(routes()[2].host(), routes()[3].host());
         assert!(tags.iter().all(|tag| !tag.contains("fqnovel")));
         assert!(routes()
             .iter()

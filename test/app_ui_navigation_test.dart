@@ -115,9 +115,11 @@ void main() {
     Finder dockLabel(String label) =>
         find.descendant(of: find.byType(ShellDock), matching: find.text(label));
 
+    expect(dockLabel('短剧'), findsNothing);
     await tester.tap(dockLabel('书架'));
     await tester.pumpAndSettle();
     expect(find.byType(LibraryPage), findsOneWidget);
+    expect(rootTab(tester), 2);
     final libraryState = tester.state(find.byType(LibraryPage));
 
     await tester.tap(dockLabel('我的'));
@@ -245,6 +247,7 @@ void main() {
     expect(find.byType(ReaderPage), findsNothing);
     expect(find.byType(MinePage), findsOneWidget);
     expect(rootTab(tester), currentTab);
+    expect(dockLabel('短剧'), findsNothing);
     expect(
       tester.state<NavigatorState>(find.byType(Navigator).first),
       same(rootNavigator),

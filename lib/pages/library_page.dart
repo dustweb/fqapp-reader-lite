@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:cupertino_ui/cupertino_ui.dart';
 import '../services/sync/multi_device_sync_service.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/rendering.dart' show ScrollDirection;
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
@@ -14,6 +15,7 @@ import '../models/shelf_view_state.dart';
 import '../models/shuqi_book.dart';
 import '../services/app_log.dart';
 import '../services/app_style_tokens.dart';
+import '../services/app_theme.dart';
 import '../services/book_open_preferences.dart';
 import '../services/book_updates.dart';
 import '../services/chapter_cache_store.dart';
@@ -301,6 +303,11 @@ mixin _LibraryPageStateBase on State<LibraryPage>, WidgetsBindingObserver {
   /// 收藏 tab 的类型筛选：null 全部 / video 短剧 / manju 漫剧（官方还有
   /// 「其他视频」，本地没有这种 kind，不放空壳胶囊）。
   String? _collectionFilter;
+
+  /// 书架 tab 的媒介类型筛选:null 全部 / book 小说 / manga 漫画 /
+  /// video 短剧 / manju 漫剧 / audio 听书。书架 tab 收全部条目,
+  /// 「收藏」tab 仍是视频源的独立视图。
+  String? _shelfKindFilter;
   bool _visible = false;
   final Map<String, int> _latestChapterCounts = {};
   final _updateChecks = UpdateCheckGate();
@@ -340,7 +347,7 @@ mixin _LibraryPageStateBase on State<LibraryPage>, WidgetsBindingObserver {
     _historyChanges = LibraryStore.instance.historyListenable
       ..addListener(_storeChanged);
     _readTimeChanges = LibraryStore.instance.readTimeListenable
-      ..addListener(_storeChanged);
+      ..addListener(_readTimeChanged);
     _shelfChanges = ShelfStore.instance.listenable..addListener(_storeChanged);
     _viewChanges = ShelfViewStore.instance..addListener(_storeChanged);
     _classicLayout = ClassicShelfLayout.instance..addListener(_storeChanged);
@@ -388,6 +395,12 @@ mixin _LibraryPageStateBase on State<LibraryPage>, WidgetsBindingObserver {
   /// them dirty and the snapshot is reloaded on the next visit.
   void _storeChanged() {
     if (_visible) _load();
+  }
+
+  void _readTimeChanged() {
+    if (!_visible) return;
+    final minutes = _todayReadMinutes();
+    if (_todayMinutes != minutes) setState(() => _todayMinutes = minutes);
   }
 
   Future<void> _loadViewPreferences() async {
@@ -587,7 +600,7 @@ mixin _LibraryPageStateBase on State<LibraryPage>, WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     shellVisibleTab.removeListener(_onShellVisibility);
     _historyChanges.removeListener(_storeChanged);
-    _readTimeChanges.removeListener(_storeChanged);
+    _readTimeChanges.removeListener(_readTimeChanged);
     _shelfChanges.removeListener(_storeChanged);
     _viewChanges.removeListener(_storeChanged);
     _classicLayout.removeListener(_storeChanged);
@@ -625,7 +638,9 @@ class _LibraryPageState extends State<LibraryPage>
               padding: EdgeInsets.fromLTRB(24, topInset, 24, 0),
               child: _editing ? _editBar(context) : _tabSegments(context),
             ),
-            const SizedBox(height: 8),
+            // 一级 tab 与内容区间距 8 → 6（issue #478）：dense 胶囊已经矮了
+            // 6dp，再收紧夹缝让顶部整块回到“切换器”的体积。
+            const SizedBox(height: 6),
           ],
           Expanded(
             child: TabSwipeArea(

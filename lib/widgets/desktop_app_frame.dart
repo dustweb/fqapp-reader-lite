@@ -3,6 +3,7 @@ import 'package:material_ui/material_ui.dart';
 
 import '../pages/settings_page.dart';
 import '../services/desktop_platform.dart';
+import '../services/drama_feature_preferences.dart';
 import 'desktop_shell_scope.dart';
 import 'desktop_window_bar.dart';
 import 'home/home_design.dart';
@@ -21,6 +22,7 @@ class DesktopAppFrame extends StatelessWidget {
   ];
 
   void _select(int index) {
+    if (index == 1 && !DramaFeaturePreferences.instance.enabled.value) return;
     DesktopPlatform.navigatorKey.currentState?.popUntil(
       (route) => route.isFirst,
     );
@@ -45,60 +47,92 @@ class DesktopAppFrame extends StatelessWidget {
         final palette = HomePalette.of(context);
         return DesktopShellScope(
           hasFrame: true,
-          child: Material(
-            color: palette.canvas,
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final canExpand = constraints.maxWidth >= 1100;
-                return ValueListenableBuilder<bool>(
-                  valueListenable: DesktopShellState.sidebarExpanded,
-                  builder: (context, userExpanded, _) {
-                    final expanded = canExpand && userExpanded;
-                    return Column(
-                      children: [
-                        DesktopWindowBar(
-                          canToggleSidebar: canExpand,
-                          sidebarExpanded: expanded,
-                        ),
-                        Expanded(
-                          child: Row(
-                            children: [
-                              _DesktopNavPane(
-                                key: const Key('desktop-nav-pane'),
-                                expanded: expanded,
-                                palette: palette,
-                                onSelectTab: _select,
-                                onOpenSettings: _openSettings,
-                              ),
-                              Expanded(
-                                child: DecoratedBox(
-                                  decoration: BoxDecoration(
-                                    color: palette.canvas,
-                                    border: Border(
-                                      top: BorderSide(color: palette.line),
-                                      left: BorderSide(color: palette.line),
+          child: ValueListenableBuilder<DesktopReaderChrome?>(
+            valueListenable: DesktopShellState.readerChrome,
+            builder: (context, readerChrome, _) {
+              final hideNavPane = readerChrome != null;
+              final frameCanvas = readerChrome?.barBackground ?? palette.canvas;
+              final frameLine = readerChrome?.border ?? palette.line;
+              return Material(
+                color: frameCanvas,
+                child: LayoutBuilder(
+                  builder: (context, constraints) {
+                    final canExpand = constraints.maxWidth >= 1100;
+                    return ValueListenableBuilder<bool>(
+                      valueListenable: DesktopShellState.sidebarExpanded,
+                      builder: (context, userExpanded, _) {
+                        final expanded = canExpand && userExpanded;
+                        return Column(
+                          children: [
+                            DesktopWindowBar(
+                              canToggleSidebar: !hideNavPane && canExpand,
+                              sidebarExpanded: expanded,
+                              readerChrome: readerChrome,
+                            ),
+                            Expanded(
+                              child: Row(
+                                children: [
+                                  if (!hideNavPane)
+                                    _DesktopNavPane(
+                                      key: const Key('desktop-nav-pane'),
+                                      expanded: expanded,
+                                      palette: palette,
+                                      onSelectTab: _select,
+                                      onOpenSettings: _openSettings,
                                     ),
-                                    borderRadius: const BorderRadius.only(
-                                      topLeft: Radius.circular(10),
-                                    ),
+                                  Expanded(
+                                    child: hideNavPane
+                                        ? DecoratedBox(
+                                            decoration: BoxDecoration(
+                                              color: frameCanvas,
+                                              border: Border(
+                                                top: BorderSide(
+                                                  color: frameLine,
+                                                ),
+                                              ),
+                                            ),
+                                            child: child,
+                                          )
+                                        : DecoratedBox(
+                                            decoration: BoxDecoration(
+                                              color: palette.canvas,
+                                              border: Border(
+                                                top: BorderSide(
+                                                  color: palette.line,
+                                                ),
+                                                left: BorderSide(
+                                                  color: palette.line,
+                                                ),
+                                              ),
+                                              borderRadius:
+                                                  const BorderRadius.only(
+                                                    topLeft: Radius.circular(
+                                                      10,
+                                                    ),
+                                                  ),
+                                            ),
+                                            child: ClipRRect(
+                                              borderRadius:
+                                                  const BorderRadius.only(
+                                                    topLeft: Radius.circular(
+                                                      10,
+                                                    ),
+                                                  ),
+                                              child: child,
+                                            ),
+                                          ),
                                   ),
-                                  child: ClipRRect(
-                                    borderRadius: const BorderRadius.only(
-                                      topLeft: Radius.circular(10),
-                                    ),
-                                    child: child,
-                                  ),
-                                ),
+                                ],
                               ),
-                            ],
-                          ),
-                        ),
-                      ],
+                            ),
+                          ],
+                        );
+                      },
                     );
                   },
-                );
-              },
-            ),
+                ),
+              );
+            },
           ),
         );
       },
@@ -138,53 +172,66 @@ class _DesktopNavPane extends StatelessWidget {
             builder: (context, selectedIndex, _) =>
                 ValueListenableBuilder<bool>(
                   valueListenable: DesktopShellState.onSettingsPage,
-                  builder: (context, inSettings, _) => Column(
-                    children: [
-                      const SizedBox(height: 6),
-                      Expanded(
-                        child: SingleChildScrollView(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: Column(
-                            children: [
-                              for (
-                                var i = 0;
-                                i < DesktopAppFrame._destinations.length;
-                                i++
-                              )
-                                _FluentNavItem(
-                                  key: ValueKey('desktop-nav-tab-$i'),
-                                  icon: DesktopAppFrame._destinations[i].icon,
-                                  label: DesktopAppFrame._destinations[i].label,
-                                  selected: !inSettings && selectedIndex == i,
-                                  expanded: visualExpanded,
-                                  palette: palette,
-                                  onTap: () => onSelectTab(i),
+                  builder: (context, inSettings, _) =>
+                      ValueListenableBuilder<bool>(
+                        valueListenable:
+                            DramaFeaturePreferences.instance.enabled,
+                        builder: (context, showDrama, _) => Column(
+                          children: [
+                            const SizedBox(height: 6),
+                            Expanded(
+                              child: SingleChildScrollView(
+                                padding: const EdgeInsets.only(bottom: 8),
+                                child: Column(
+                                  children: [
+                                    for (
+                                      var i = 0;
+                                      i < DesktopAppFrame._destinations.length;
+                                      i++
+                                    )
+                                      if (showDrama || i != 1)
+                                        _FluentNavItem(
+                                          key: ValueKey('desktop-nav-tab-$i'),
+                                          icon: DesktopAppFrame
+                                              ._destinations[i]
+                                              .icon,
+                                          label: DesktopAppFrame
+                                              ._destinations[i]
+                                              .label,
+                                          selected:
+                                              !inSettings && selectedIndex == i,
+                                          expanded: visualExpanded,
+                                          palette: palette,
+                                          onTap: () => onSelectTab(i),
+                                        ),
+                                  ],
                                 ),
-                            ],
-                          ),
+                              ),
+                            ),
+                            Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                              ),
+                              child: Divider(
+                                height: 1,
+                                thickness: 1,
+                                color: palette.line,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            _FluentNavItem(
+                              key: const Key('desktop-settings'),
+                              icon: LucideIcons.settings,
+                              label: '设置',
+                              selected: inSettings,
+                              expanded: visualExpanded,
+                              palette: palette,
+                              onTap: onOpenSettings,
+                            ),
+                            const SizedBox(height: 10),
+                          ],
                         ),
                       ),
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 12),
-                        child: Divider(
-                          height: 1,
-                          thickness: 1,
-                          color: palette.line,
-                        ),
-                      ),
-                      const SizedBox(height: 6),
-                      _FluentNavItem(
-                        key: const Key('desktop-settings'),
-                        icon: LucideIcons.settings,
-                        label: '设置',
-                        selected: inSettings,
-                        expanded: visualExpanded,
-                        palette: palette,
-                        onTap: onOpenSettings,
-                      ),
-                      const SizedBox(height: 10),
-                    ],
-                  ),
                 ),
           );
         },

@@ -8,6 +8,7 @@ use md5::{Digest, Md5};
 use crate::device::{Device, DevicePool};
 use crate::sign::Manager;
 use crate::upstream::http::{HttpTransport, TransportError};
+use crate::upstream::playback_identity::{PlaybackDevice, PlaybackIdentity};
 
 pub const DEFAULT_USER_AGENT: &str = "com.dragon.read/66732 (Linux; U; Android 10; zh_CN; Pixel 4 XL; Build/QD1A.190821.007;tt-ok/3.12.13.4-tiktok)";
 
@@ -117,6 +118,8 @@ pub struct UpstreamClient {
     /// therefore every signature input - are untouched, so a local mock server
     /// can answer real signed requests without touching the network.
     mock_origin: Option<String>,
+    /// Anonymous playback identity, intentionally separate from the pool.
+    playback_identity: PlaybackIdentity,
 }
 
 impl UpstreamClient {
@@ -138,12 +141,14 @@ impl UpstreamClient {
         sign: Manager,
         mock_origin: Option<String>,
     ) -> Result<Self, String> {
+        let playback_identity = PlaybackIdentity::new(mock_origin.clone())?;
         Ok(UpstreamClient {
             http: HttpTransport::new(15)?,
             sign,
             pool,
             max_retries: 3,
             mock_origin,
+            playback_identity,
         })
     }
 
@@ -226,18 +231,29 @@ impl UpstreamClient {
         }
 
         if let Some(trace) = super::playback_trace::current() {
+            let envelope = if crate::sign::v5::playback_envelope_is_full(query) {
+                "full"
+            } else {
+                "legacy"
+            };
+            trace
+                .exchange
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .envelope = envelope;
             let body = req.body.as_deref().unwrap_or_default();
             let stub = hex::encode_upper(Md5::digest(body));
             let stub_matches = headers.iter().any(|(name, value)| {
                 name.eq_ignore_ascii_case("x-ss-stub") && value.eq_ignore_ascii_case(&stub)
             });
             log::info!(
-                "v5 trace request={} purpose={} attempt={} device={} in_flight={} event=send body_bytes={} stub_matches={stub_matches}",
+                "v5 trace request={} purpose={} attempt={} device={} in_flight={} event=send route={} envelope={envelope} body_bytes={} stub_matches={stub_matches}",
                 trace.request_id,
                 trace.purpose,
                 trace.attempt,
                 trace.device_tag,
                 trace.in_flight,
+                trace.route,
                 body.len(),
             );
         }
@@ -525,6 +541,9 @@ impl UpstreamClient {
                 Err(err) => {
                     last_err = Some(err.clone());
                     if err.is_device_failed() {
+                        if Self::speculative_playback() {
+                            return Err(err);
+                        }
                         if super::budget::remaining().is_some_and(|left| left.is_zero()) {
                             return Err(err);
                         }
@@ -595,6 +614,9 @@ impl UpstreamClient {
                 Err(err) => {
                     last_err = Some(err.clone());
                     if err.is_device_failed() {
+                        if Self::speculative_playback() {
+                            return Err(err);
+                        }
                         if super::budget::remaining().is_some_and(|left| left.is_zero()) {
                             return Err(err);
                         }
@@ -624,10 +646,21 @@ impl UpstreamClient {
                 return Ok(device);
             }
         }
+        if Self::speculative_playback() {
+            return self
+                .pool
+                .get_excluding("")
+                .await
+                .map_err(|_| ClientError::Other("no playback device available".to_string()));
+        }
         self.pool
             .get()
             .await
             .map_err(|e| ClientError::Other(format!("get device: {e}")))
+    }
+
+    fn speculative_playback() -> bool {
+        super::playback_trace::current().is_some_and(|trace| trace.purpose == "prefetch")
     }
 
     /// Body-only wrapper kept for callers that do not need the identity that
@@ -637,6 +670,78 @@ impl UpstreamClient {
         if data.is_empty() {
             return Err(ClientError::EmptyPlaybackBody);
         }
+        Ok(data)
+    }
+
+    /// Calls the enhanced anonymous V5 playback door.
+    ///
+    /// The identity never enters `DevicePool`, so this path neither reads nor
+    /// writes the generic playback pin. An empty HTTP 200 body may refresh the
+    /// cached anonymous identity once, paced by the identity cache; it is then
+    /// returned as an empty body so the endpoint's route ladder can fall back.
+    pub async fn anonymous_playback(
+        &self,
+        base: &str,
+        body: &[u8],
+    ) -> Result<(Vec<u8>, String), ClientError> {
+        let device = self
+            .playback_identity
+            .current()
+            .await
+            .map_err(ClientError::Other)?;
+        let data = self
+            .send_anonymous_playback_once(base, body, &device)
+            .await?;
+        if !data.is_empty() {
+            return Ok((data, device.device_id));
+        }
+        log::info!("v5 playback empty response route=anon event=refresh");
+        match self
+            .playback_identity
+            .refresh_after_empty(&device.device_id)
+            .await
+        {
+            Ok(Some(refreshed)) => {
+                let data = self
+                    .send_anonymous_playback_once(base, body, &refreshed)
+                    .await?;
+                Ok((data, refreshed.device_id))
+            }
+            Ok(None) => Ok((Vec::new(), device.device_id)),
+            Err(error) => Err(ClientError::Other(error)),
+        }
+    }
+
+    async fn send_anonymous_playback_once(
+        &self,
+        base: &str,
+        body: &[u8],
+        device: &PlaybackDevice,
+    ) -> Result<Vec<u8>, ClientError> {
+        let identity = crate::sign::v5::AnonymousV5Identity {
+            device_id: &device.device_id,
+            install_id: &device.install_id,
+            cdid: &device.cdid,
+            egdi: &device.egdi,
+        };
+        let send = self.do_resp_with_transient_retry(
+            || {
+                let signed = crate::sign::v5::sign_anonymous_playback_v5(base, body, &identity)
+                    .map_err(ClientError::Other)?;
+                Ok(UpstreamRequest {
+                    method: Some("POST".to_string()),
+                    url: signed.url,
+                    body: Some(body.to_vec()),
+                    headers: signed.headers,
+                    no_sign: true,
+                    pin: None,
+                })
+            },
+            Some(crate::upstream::http::API_BODY_LIMIT_BYTES),
+            true,
+            false,
+        );
+        let (data, _) = super::playback_trace::with_device(&device.device_id, send).await?;
         Ok(data)
     }
 

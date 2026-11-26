@@ -45,9 +45,12 @@ static STREAM_TRACE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::
 const V5_PLAYER_URL: &str =
     "https://api5-normal-sinfonlinea.fqnovel.com/novel/player/multi_video_model/player/v1";
 
-/// The official app's `GET` playback-model door carrying the model list, used
-/// as the second attempt when the v5 player door answers an empty body.
+const ANONYMOUS_PLAYER_URL: &str =
+    "https://api5-normal-sinfonlinea.fqnovel.com/novel/player/multi_video_model/player/v1/";
+
 const VIDEO_TAB_PLAYER_PATH: &str = "/reading/bookapi/video_tab/multi_video_model/v1/";
+
+const VIDEO_MODEL_PLAYER_PATH: &str = "/novel/player/video_model/v1/";
 
 /// Hard cap on playback-door attempts per request, re-probe and rotation round
 /// included.
@@ -61,6 +64,17 @@ const SAME_DOOR_REPROBE_DELAY: Duration = Duration::from_millis(250);
 /// The re-probe needs this much caller budget left: another round trip is not
 /// worth starting when the caller is nearly out of time.
 const REPROBE_MIN_BUDGET: Duration = Duration::from_millis(1_000);
+
+const CODEC_RETRY_BUDGET: Duration = Duration::from_millis(2_500);
+
+/// Request flag by which the caller declares it decodes `bytevc2` itself (it
+/// ships a transcoder). Without it the codec gate stays as strict as
+/// `CRIT-004` left it, so every existing caller keeps its current verdict.
+const TRANSCODE_PARAM: &str = "transcode";
+
+/// Codec name reported back for the one stream that only plays after the
+/// caller's own transcode.
+const BYTEVC2_CODEC: &str = "bytevc2";
 
 /// A rotation needs this much caller budget left to be worth attempting: a
 /// replacement registration is several round trips.
@@ -131,6 +145,17 @@ enum FallbackResolution {
     Inconclusive,
 }
 
+/// How one entry of a model's own `video_list` scores against the codec gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimaryVariantClass {
+    /// No playable url in any of the url fields.
+    None,
+    /// Playable url and a decodable codec: the primary resolution can use it.
+    Compatible,
+    /// Playable url but the codec gate rejects it (bytevc2, H.266-class).
+    UnsupportedCodec,
+}
+
 /// Request-local fallback bodies; failed or empty responses are never inserted.
 type FallbackBodyCache = Arc<Mutex<HashMap<String, Arc<Map<String, Value>>>>>;
 
@@ -156,6 +181,9 @@ fn handle_video<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, ApiResult
         }
 
         let stream_mode = params.get_str("mode") == "stream";
+        // A client that transcodes `bytevc2` itself says so here; the strict
+        // gate below is what every other caller keeps.
+        let transcodes_bytevc2 = params.get_str(TRANSCODE_PARAM) == "1";
         let source_trace_id =
             STREAM_TRACE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let purpose =
@@ -174,28 +202,27 @@ fn handle_video<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, ApiResult
         let work_deadline = work_started + work_budget;
         let fetch_deadline = work_started + fetch_budget;
         let resolution_deadline = work_started + resolution_budget;
-        let parsed = crate::upstream::playback_trace::within(
+        let playback = crate::upstream::playback_trace::within(
             source_trace_id,
             purpose,
-            fetch_parsed_video_response(
-                "v5",
+            fetch_resolved_playback_model(
+                ctx,
                 &video_id,
                 fetch_deadline,
-                fetch_playback_model(ctx, &video_id, fetch_deadline, purpose),
+                resolution_deadline,
+                work_deadline,
+                purpose,
+                transcodes_bytevc2,
             ),
         )
-        .await
-        .ok_or_else(|| ApiError::Internal("视频取流失败,请稍后重试".to_string()))?;
-        let fallback_bodies = new_fallback_body_cache();
-        let resolved = resolve_video_source_until(
-            ctx,
-            &video_id,
-            "v5",
-            &parsed,
-            &fallback_bodies,
-            resolution_deadline,
-        )
-        .await;
+        .await?;
+        let ResolvedPlaybackModel {
+            parsed,
+            model: answered,
+            fallback_bodies,
+            resolved,
+            codec,
+        } = playback;
 
         // 官方 `wp3/o1.java:301-347` 的 `isSupportShowLandIcon` 按服务端
         // `vertical` 决定竖屏剧集是否给「全屏观看」（竖屏不给）。该字段随
@@ -207,8 +234,9 @@ fn handle_video<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, ApiResult
             && legacy_raw_response_has_playable_url(&parsed)
         {
             log::info!(
-                "stream trace request={source_trace_id} purpose={purpose} event=final mode={} selected_source=v5 bodies=1 quality_count=0 result=legacy_raw",
+                "stream trace request={source_trace_id} purpose={purpose} event=final mode={} selected_source={} bodies=1 quality_count=0 result=legacy_raw",
                 if stream_mode { "stream" } else { "single" },
+                answered.route.tag(),
             );
             return Ok(parsed.root);
         }
@@ -235,7 +263,7 @@ fn handle_video<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, ApiResult
             &parsed,
             &fallback_bodies,
             &video_url,
-            source_trace_id,
+            (source_trace_id, answered.route.tag()),
             variant_deadline,
         )
         .await;
@@ -259,8 +287,9 @@ fn handle_video<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, ApiResult
             .collect::<Vec<_>>()
             .join(",");
         log::info!(
-            "stream trace request={source_trace_id} purpose={purpose} event=final mode={} selected_source=v5 bodies=1 fallback_bodies={} quality_count={} raw_entries={} kept={} dropped=[{}] qualities=[{quality_trace}] primary_in_variants={primary_in_variants}",
+            "stream trace request={source_trace_id} purpose={purpose} event=final mode={} selected_source={} bodies=1 fallback_bodies={} quality_count={} raw_entries={} kept={} dropped=[{}] qualities=[{quality_trace}] primary_in_variants={primary_in_variants} codec={codec}",
             if stream_mode { "stream" } else { "single" },
+            answered.route.tag(),
             fallback_bodies
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -276,6 +305,7 @@ fn handle_video<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, ApiResult
             "key_hex": hex::encode(&content_key),
             "video_id": video_id,
             "source_trace_id": source_trace_id,
+            "codec": codec,
             // 分集方向（官方 `VideoInfo.vertical`）：缺字段时 null，客户端
             // 据此保持旧行为（显示「全屏观看」）。
             "vertical": vertical,
@@ -294,6 +324,7 @@ fn handle_video<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, ApiResult
                     "video_url": local_path,
                     "video_id": video_id,
                     "source_trace_id": source_trace_id,
+                    "codec": codec,
                     "vertical": vertical,
                     "video_info": {
                         "data": {
@@ -339,6 +370,119 @@ fn v5_playback_body(video_id: &str) -> ApiResult<Vec<u8>> {
         .map_err(|e| ApiError::Internal(format!("gzip v5 playback body: {e}")))
 }
 
+fn anonymous_playback_body(video_id: &str) -> ApiResult<Vec<u8>> {
+    let plain = serde_json::to_vec(&json!({
+        "biz_param": {
+            "detail_page_version": 0,
+            "device_level": 1,
+            "disable_digg_stat": false,
+            "disable_video_relate_book": false,
+            "need_all_video_definition": true,
+            "need_mp4_align": false,
+            "use_os_player": false,
+            "use_server_dns": false,
+            "video_platform": 1024,
+        },
+        "dr_scene": "player",
+        "mixed_video_id_map": {
+            "1004": [video_id],
+        },
+        "video_id": video_id,
+        "content_type": 1,
+    }))
+    .map_err(|error| ApiError::Internal(format!("marshal anonymous playback body: {error}")))?;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(&plain)
+        .map_err(|error| ApiError::Internal(format!("gzip anonymous playback body: {error}")))?;
+    encoder
+        .finish()
+        .map_err(|error| ApiError::Internal(format!("gzip anonymous playback body: {error}")))
+}
+
+fn video_model_body(video_id: &str) -> ApiResult<Vec<u8>> {
+    let plain = serde_json::to_vec(&json!({
+        "biz_param": {
+            "detail_page_version": 0,
+            "device_level": 3,
+            "disable_digg_stat": false,
+            "from_video_id": "",
+            "need_all_video_definition": true,
+            "need_mp4_align": false,
+            "source": 9,
+            "use_os_player": false,
+            "use_server_dns": false,
+            "video_platform": 3,
+        },
+        "content_type": 1004,
+        "video_id": video_id,
+    }))
+    .map_err(|error| ApiError::Internal(format!("marshal video model body: {error}")))?;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(&plain)
+        .map_err(|error| ApiError::Internal(format!("gzip video model body: {error}")))?;
+    encoder
+        .finish()
+        .map_err(|error| ApiError::Internal(format!("gzip video model body: {error}")))
+}
+
+struct PlaybackBodies {
+    anonymous: Vec<u8>,
+    v5: Vec<u8>,
+    model: Vec<u8>,
+}
+
+impl PlaybackBodies {
+    fn build(video_id: &str) -> ApiResult<Self> {
+        Ok(Self {
+            anonymous: anonymous_playback_body(video_id)?,
+            v5: v5_playback_body(video_id)?,
+            model: video_model_body(video_id)?,
+        })
+    }
+}
+
+struct PlaybackModel {
+    body: Vec<u8>,
+    route: crate::upstream::playback_routes::Route,
+    device_id: Option<String>,
+}
+
+struct ResolvedPlaybackModel {
+    parsed: ParsedVideoResponse,
+    model: PlaybackModel,
+    fallback_bodies: FallbackBodyCache,
+    resolved: VideoSourceResolution,
+    /// `""` for a stream that plays as-is, [`BYTEVC2_CODEC`] for the last-resort
+    /// rendition the caller has to transcode before it can decode it.
+    codec: &'static str,
+}
+
+struct PlaybackRecovery {
+    bodies: PlaybackBodies,
+    pin: Option<String>,
+    skip_routes: HashSet<crate::upstream::playback_routes::Route>,
+    attempts: usize,
+    reprobed: bool,
+    rotated: bool,
+    all_empty: bool,
+}
+
+impl PlaybackRecovery {
+    fn build(video_id: &str) -> ApiResult<Self> {
+        Ok(Self {
+            bodies: PlaybackBodies::build(video_id)?,
+            pin: None,
+            skip_routes: HashSet::new(),
+            attempts: 0,
+            reprobed: false,
+            rotated: false,
+            all_empty: true,
+        })
+    }
+}
+
 /// What one playback-door attempt produced.
 enum DoorOutcome {
     /// A non-empty 200 body.
@@ -355,6 +499,7 @@ struct PlaybackAttempt {
     outcome: DoorOutcome,
     /// Identity that produced this outcome, when the transport revealed it.
     device_id: Option<String>,
+    exchange: crate::upstream::playback_trace::PlaybackExchange,
 }
 
 /// The `video_tab` door's own query fields: the official app's snake_case
@@ -416,39 +561,104 @@ fn video_tab_player_shape(raw: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// One `POST` on a door of the player family, reporting which identity answered.
+async fn playback_post(
+    ctx: &Ctx,
+    base: &str,
+    body: &[u8],
+    pin: Option<&str>,
+    deadline: Instant,
+) -> PlaybackAttempt {
+    match tokio::time::timeout_at(deadline, ctx.up.v5_playback_with_device(base, body, pin)).await {
+        Err(_) => PlaybackAttempt {
+            outcome: DoorOutcome::Deadline,
+            device_id: None,
+            exchange: Default::default(),
+        },
+        Ok(Ok((data, device))) => PlaybackAttempt {
+            outcome: if data.is_empty() {
+                DoorOutcome::Empty
+            } else {
+                DoorOutcome::Body(data)
+            },
+            device_id: Some(device.device_id),
+            exchange: Default::default(),
+        },
+        Ok(Err(_)) => PlaybackAttempt {
+            outcome: DoorOutcome::Failed,
+            device_id: None,
+            exchange: Default::default(),
+        },
+    }
+}
+
 async fn attempt_playback_route(
     ctx: &Ctx,
     video_id: &str,
-    body: &[u8],
+    bodies: &PlaybackBodies,
+    route: crate::upstream::playback_routes::Route,
+    pin: Option<&str>,
+    deadline: Instant,
+) -> PlaybackAttempt {
+    crate::upstream::playback_trace::with_route(route.tag(), async {
+        let mut attempt =
+            attempt_playback_route_inner(ctx, video_id, bodies, route, pin, deadline).await;
+        if let Some(trace) = crate::upstream::playback_trace::current() {
+            attempt.exchange = *trace
+                .exchange
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        attempt
+    })
+    .await
+}
+
+async fn attempt_playback_route_inner(
+    ctx: &Ctx,
+    video_id: &str,
+    bodies: &PlaybackBodies,
     route: crate::upstream::playback_routes::Route,
     pin: Option<&str>,
     deadline: Instant,
 ) -> PlaybackAttempt {
     use crate::upstream::playback_routes::Door;
     match route.door {
-        Door::V5Player => match tokio::time::timeout_at(
-            deadline,
-            ctx.up.v5_playback_with_device(V5_PLAYER_URL, body, pin),
-        )
-        .await
-        {
-            Err(_) => PlaybackAttempt {
-                outcome: DoorOutcome::Deadline,
-                device_id: None,
-            },
-            Ok(Ok((data, device))) => PlaybackAttempt {
-                outcome: if data.is_empty() {
-                    DoorOutcome::Empty
-                } else {
-                    DoorOutcome::Body(data)
+        Door::AnonymousV5 => {
+            match tokio::time::timeout_at(
+                deadline,
+                ctx.up
+                    .anonymous_playback(ANONYMOUS_PLAYER_URL, &bodies.anonymous),
+            )
+            .await
+            {
+                Err(_) => PlaybackAttempt {
+                    outcome: DoorOutcome::Deadline,
+                    device_id: None,
+                    exchange: Default::default(),
                 },
-                device_id: Some(device.device_id),
-            },
-            Ok(Err(_)) => PlaybackAttempt {
-                outcome: DoorOutcome::Failed,
-                device_id: None,
-            },
-        },
+                Ok(Ok((data, _device_id))) => PlaybackAttempt {
+                    outcome: if data.is_empty() {
+                        DoorOutcome::Empty
+                    } else {
+                        DoorOutcome::Body(data)
+                    },
+                    // The anonymous identity must never become a pool pin.
+                    device_id: None,
+                    exchange: Default::default(),
+                },
+                Ok(Err(_)) => PlaybackAttempt {
+                    outcome: DoorOutcome::Failed,
+                    device_id: None,
+                    exchange: Default::default(),
+                },
+            }
+        }
+        Door::V5Player => playback_post(ctx, V5_PLAYER_URL, &bodies.v5, pin, deadline).await,
+        Door::VideoModel => {
+            let base = format!("{}{}", route.host(), VIDEO_MODEL_PLAYER_PATH);
+            playback_post(ctx, &base, &bodies.model, pin, deadline).await
+        }
         Door::VideoTab => {
             let base = format!("{}{}", route.host(), VIDEO_TAB_PLAYER_PATH);
             let extra = video_tab_query(video_id);
@@ -458,6 +668,7 @@ async fn attempt_playback_route(
                 Err(_) => PlaybackAttempt {
                     outcome: DoorOutcome::Deadline,
                     device_id: None,
+                    exchange: Default::default(),
                 },
                 Ok(Ok((raw, device))) => {
                     let device_id = Some(device.device_id);
@@ -465,22 +676,26 @@ async fn attempt_playback_route(
                         return PlaybackAttempt {
                             outcome: DoorOutcome::Empty,
                             device_id,
+                            exchange: Default::default(),
                         };
                     }
                     match video_tab_player_shape(&raw) {
                         Some(shaped) => PlaybackAttempt {
                             outcome: DoorOutcome::Body(shaped),
                             device_id,
+                            exchange: Default::default(),
                         },
                         None => PlaybackAttempt {
                             outcome: DoorOutcome::Failed,
                             device_id,
+                            exchange: Default::default(),
                         },
                     }
                 }
                 Ok(Err(_)) => PlaybackAttempt {
                     outcome: DoorOutcome::Failed,
                     device_id: None,
+                    exchange: Default::default(),
                 },
             }
         }
@@ -502,9 +717,9 @@ async fn rotate_playback_identity(
             log::info!("v5 trace request={request_id} purpose={purpose} event=rotate result=ok");
             Some(device.device_id)
         }
-        Ok(Err(error)) => {
+        Ok(Err(_)) => {
             log::warn!(
-                "v5 trace request={request_id} purpose={purpose} event=rotate result=unavailable error={error}"
+                "v5 trace request={request_id} purpose={purpose} event=rotate result=unavailable"
             );
             None
         }
@@ -517,198 +732,327 @@ async fn rotate_playback_identity(
     }
 }
 
-/// Fetches the playback model through every playback door.
-///
-/// Ported from `N3urda/hongguoTV`'s `streamLadderWithCompatibility`: a single
-/// v5 attempt, then the signed `video_tab` doors under the same identity, with
-/// per-door cooldowns (30 s after an empty body, 5 s after any other failure)
-/// and at most one identity rotation per request. Prefetch callers never probe
-/// a cooling door and never rotate.
 async fn fetch_playback_model(
     ctx: &Ctx,
     video_id: &str,
     deadline: Instant,
     purpose: &'static str,
-) -> ApiResult<Vec<u8>> {
+    recovery: &mut PlaybackRecovery,
+) -> ApiResult<PlaybackModel> {
     use crate::upstream::playback_routes;
 
     let speculative = purpose == "prefetch";
     let request_id = crate::upstream::playback_trace::current().map_or(0, |trace| trace.request_id);
-    let body = v5_playback_body(video_id)?;
-    let mut pin: Option<String> = None;
-    let mut all_empty = true;
-    let mut attempts = 0usize;
-    // One same-door re-probe per request: an empty body is usually a transient
-    // per-request refusal, and the same door answers again a moment later.
-    let mut reprobed = false;
-
-    // A long empty streak rotates the identity before the next attempt, which is
-    // what recovered live playback for the reference implementation.
-    if playback_routes::with_state(|state| state.rotate_due(playback_routes::now_ms(), speculative))
-        && crate::upstream::budget::remaining().is_none_or(|left| left > ROTATION_MIN_BUDGET)
-    {
-        pin = rotate_playback_identity(ctx, deadline, None).await;
-        playback_routes::with_state(|state| {
-            state.note_rotate(playback_routes::now_ms(), pin.is_some())
-        });
-    }
-
-    for round in 0..2u8 {
-        let now = playback_routes::now_ms();
-        let plan = playback_routes::with_state(|state| state.plan(now, speculative));
-        for route in plan {
-            if attempts >= MAX_PLAYBACK_ATTEMPTS || Instant::now() >= deadline {
-                break;
-            }
-            attempts += 1;
+    let plan = if recovery.rotated && !speculative {
+        playback_routes::routes()
+    } else {
+        playback_routes::with_state(|state| state.plan(playback_routes::now_ms(), speculative))
+    };
+    for route in plan {
+        if recovery.skip_routes.contains(&route) {
+            continue;
+        }
+        if recovery.attempts >= MAX_PLAYBACK_ATTEMPTS || Instant::now() >= deadline {
+            break;
+        }
+        let route_parked =
+            playback_routes::with_state(|state| state.parked(route, playback_routes::now_ms()));
+        let mut reprobe = false;
+        let attempt = loop {
+            recovery.attempts += 1;
             let started = Instant::now();
-            // Decided before the attempt: a door that is already parked is being
-            // probed deliberately, not freshly refused, so it earns no re-probe.
-            let route_parked = playback_routes::with_state(|state| state.parked(route, now));
-            let mut attempt =
-                attempt_playback_route(ctx, video_id, &body, route, pin.as_deref(), deadline).await;
+            let attempt = crate::upstream::playback_trace::with_attempt(
+                recovery.attempts,
+                attempt_playback_route(
+                    ctx,
+                    video_id,
+                    &recovery.bodies,
+                    route,
+                    recovery.pin.as_deref(),
+                    deadline,
+                ),
+            )
+            .await;
+            let result = match &attempt.outcome {
+                DoorOutcome::Body(_) => "ok",
+                DoorOutcome::Empty => "empty",
+                DoorOutcome::Failed => "failed",
+                DoorOutcome::Deadline => "deadline",
+            };
+            let status = attempt
+                .exchange
+                .http_status
+                .map_or_else(|| "-".to_string(), |status| status.to_string());
+            let body_len = attempt
+                .exchange
+                .body_len
+                .map_or_else(|| "-".to_string(), |length| length.to_string());
+            log::info!(
+                "v5 trace request={request_id} purpose={purpose} event=door route={} http_status={status} body_len={body_len} elapsed_ms={} result={result} envelope={} reprobe={reprobe}",
+                route.tag(),
+                started.elapsed().as_millis(),
+                attempt.exchange.envelope,
+            );
+            if let Some(device_id) = attempt.device_id.as_ref() {
+                recovery.pin = Some(device_id.clone());
+            }
+            recovery.all_empty &= matches!(attempt.outcome, DoorOutcome::Empty);
             let can_reprobe = matches!(attempt.outcome, DoorOutcome::Empty)
-                && !reprobed
+                && !recovery.reprobed
                 && !route_parked
                 && !speculative
-                && route.door == crate::upstream::playback_routes::Door::V5Player
-                && attempts < MAX_PLAYBACK_ATTEMPTS
+                && recovery.attempts < MAX_PLAYBACK_ATTEMPTS
                 && Instant::now() + REPROBE_MIN_BUDGET < deadline
                 && crate::upstream::budget::remaining()
                     .is_none_or(|left| left > REPROBE_MIN_BUDGET);
             if can_reprobe && crate::upstream::budget::retry_pause(SAME_DOOR_REPROBE_DELAY).await {
-                reprobed = true;
-                attempts += 1;
-                log::info!(
-                    "v5 trace request={request_id} purpose={purpose} event=door route={} result=reprobe",
-                    route.tag(),
-                );
-                attempt = attempt_playback_route(
-                    ctx,
-                    video_id,
-                    &body,
+                recovery.reprobed = true;
+                reprobe = true;
+                continue;
+            }
+            break attempt;
+        };
+        recovery.skip_routes.insert(route);
+        let now = playback_routes::now_ms();
+        // A speculative miss must not park the only anonymous door: it is
+        // background work and the foreground click still needs that route.
+        let skip_empty_cooldown = speculative && route.door == playback_routes::Door::AnonymousV5;
+        match attempt.outcome {
+            DoorOutcome::Body(raw) => {
+                return Ok(PlaybackModel {
+                    body: raw,
                     route,
-                    attempt.device_id.as_deref(),
-                    deadline,
-                )
-                .await;
+                    device_id: attempt.device_id,
+                });
             }
-            let elapsed = started.elapsed().as_millis();
-            let outcome = match attempt.outcome {
-                DoorOutcome::Body(raw) => {
-                    log::info!(
-                        "v5 trace request={request_id} purpose={purpose} event=door route={} result=ok elapsed_ms={elapsed} body_len={}",
-                        route.tag(),
-                        raw.len(),
-                    );
-                    playback_routes::with_state(|state| {
-                        state.success(route, playback_routes::now_ms());
-                        state.note_round(false);
-                    });
-                    return Ok(raw);
-                }
-                DoorOutcome::Empty => {
-                    log::info!(
-                        "v5 trace request={request_id} purpose={purpose} event=door route={} result=empty elapsed_ms={elapsed}",
-                        route.tag(),
-                    );
-                    playback_routes::with_state(|state| state.failed(route, now, true));
-                    DoorOutcome::Empty
-                }
-                DoorOutcome::Failed => {
-                    log::warn!(
-                        "v5 trace request={request_id} purpose={purpose} event=door route={} result=failed elapsed_ms={elapsed}",
-                        route.tag(),
-                    );
-                    playback_routes::with_state(|state| state.failed(route, now, false));
-                    DoorOutcome::Failed
-                }
-                DoorOutcome::Deadline => {
-                    playback_routes::with_state(|state| state.failed(route, now, false));
-                    DoorOutcome::Deadline
-                }
-            };
-            if !matches!(outcome, DoorOutcome::Empty) {
-                all_empty = false;
+            DoorOutcome::Empty if skip_empty_cooldown => {}
+            DoorOutcome::Empty => {
+                playback_routes::with_state(|state| state.failed(route, now, true))
             }
-            if let Some(device_id) = attempt.device_id {
-                pin = Some(device_id);
+            DoorOutcome::Failed => {
+                playback_routes::with_state(|state| state.failed(route, now, false))
             }
-            if matches!(outcome, DoorOutcome::Deadline) {
+            DoorOutcome::Deadline => {
+                playback_routes::with_state(|state| state.failed(route, now, false));
                 break;
             }
         }
+    }
+    Err(ApiError::Internal("视频取流失败,请稍后重试".to_string()))
+}
 
-        // A round that ended with every door parked may still buy one rotation,
-        // but only while pacing allows it: the device pool is bounded.
-        let parked =
-            playback_routes::with_state(|state| state.exhausted(playback_routes::now_ms()));
-        let now_after = playback_routes::now_ms();
-        let paced =
-            playback_routes::with_state(|state| state.rotation_paced(now_after, speculative));
-        let due = playback_routes::with_state(|state| state.rotate_due(now_after, speculative));
-        let can_rotate = round == 0
-            && paced
-            && (parked || due)
-            && crate::upstream::budget::remaining().is_none_or(|left| left > ROTATION_MIN_BUDGET);
-        if !can_rotate {
+async fn fetch_resolved_playback_model(
+    ctx: &Ctx,
+    video_id: &str,
+    fetch_deadline: Instant,
+    resolution_deadline: Instant,
+    work_deadline: Instant,
+    purpose: &'static str,
+    transcodes_bytevc2: bool,
+) -> ApiResult<ResolvedPlaybackModel> {
+    use crate::upstream::playback_routes;
+
+    let speculative = purpose == "prefetch";
+    let mut recovery = PlaybackRecovery::build(video_id)?;
+    let request_id = crate::upstream::playback_trace::current().map_or(0, |trace| trace.request_id);
+    let mut retry_deadline = None;
+    let mut rejected = None;
+    let mut rejected_has_transcodable_source = false;
+    let mut has_codec_rejection = false;
+    loop {
+        let deadline = retry_deadline.unwrap_or(fetch_deadline).min(work_deadline);
+        if recovery.attempts >= MAX_PLAYBACK_ATTEMPTS || Instant::now() >= work_deadline {
             break;
         }
-        let rotated = rotate_playback_identity(ctx, deadline, pin.as_deref()).await;
+        let before = recovery.attempts;
+        let fetched = if Instant::now() < deadline {
+            fetch_parsed_playback_model(ctx, video_id, deadline, purpose, &mut recovery).await
+        } else {
+            None
+        };
+        if let Some((parsed, model)) = fetched {
+            recovery.pin = model.device_id.clone();
+            let fallback_bodies = new_fallback_body_cache();
+            let resolved = resolve_video_source_until(
+                ctx,
+                video_id,
+                model.route.tag(),
+                &parsed,
+                &fallback_bodies,
+                retry_deadline
+                    .unwrap_or(resolution_deadline)
+                    .min(work_deadline),
+                transcodes_bytevc2,
+            )
+            .await;
+            let answer = ResolvedPlaybackModel {
+                parsed,
+                model,
+                fallback_bodies,
+                resolved,
+                codec: "",
+            };
+            if matches!(answer.resolved, VideoSourceResolution::Found(_, _))
+                || (retry_deadline.is_none()
+                    && legacy_raw_response_has_playable_url(&answer.parsed))
+            {
+                playback_routes::with_state(|state| {
+                    state.success(answer.model.route, playback_routes::now_ms());
+                    state.note_round(false);
+                });
+                return Ok(answer);
+            }
+            // A failed fallback cannot erase a usable bytevc2-only primary.
+            // Keep looking for native playback, then use that primary only for
+            // callers that explicitly declared their own transcoder.
+            let primary_transcodable = transcodes_bytevc2
+                && answer.parsed.models.iter().any(|model| {
+                    model_primary_rejected_only(model)
+                        && matches!(
+                            extract_transcodable_video_model_source(model),
+                            VideoSourceResolution::Found(_, _)
+                        )
+                });
+            let codec_rejected = matches!(answer.resolved, VideoSourceResolution::CodecRejected)
+                || primary_transcodable;
+            has_codec_rejection |= codec_rejected;
+            let has_transcodable_source = transcodes_bytevc2
+                && !rejected_has_transcodable_source
+                && codec_rejected
+                && matches!(
+                    transcodable_source(&answer),
+                    VideoSourceResolution::Found(_, _)
+                );
+            if rejected.is_none() || has_transcodable_source {
+                rejected = Some(answer);
+                rejected_has_transcodable_source = has_transcodable_source;
+            }
+            if speculative {
+                break;
+            }
+            continue;
+        }
+        if recovery.attempts > before {
+            if speculative {
+                break;
+            }
+            continue;
+        }
+        if speculative || recovery.rotated {
+            break;
+        }
+        let now = playback_routes::now_ms();
+        let can_rotate = if rejected.is_some() {
+            true
+        } else {
+            playback_routes::with_state(|state| {
+                state.rotation_paced(now, false)
+                    && (state.exhausted(now) || state.rotate_due(now, false))
+            })
+        };
+        let next_deadline = if rejected.is_some() {
+            (Instant::now() + CODEC_RETRY_BUDGET).min(work_deadline)
+        } else {
+            fetch_deadline
+        };
+        if !can_rotate
+            || recovery.attempts >= MAX_PLAYBACK_ATTEMPTS
+            || Instant::now() + ROTATION_MIN_BUDGET >= next_deadline
+            || crate::upstream::budget::remaining().is_some_and(|left| left <= ROTATION_MIN_BUDGET)
+        {
+            break;
+        }
+        recovery.rotated = true;
+        let rotation_deadline = if rejected.is_some() {
+            next_deadline - REPROBE_MIN_BUDGET
+        } else {
+            next_deadline
+        };
+        let rotated =
+            rotate_playback_identity(ctx, rotation_deadline, recovery.pin.as_deref()).await;
         playback_routes::with_state(|state| {
             state.note_rotate(playback_routes::now_ms(), rotated.is_some())
         });
-        match rotated {
-            Some(device_id) => {
-                pin = Some(device_id);
-                continue;
-            }
-            None => break,
-        }
+        let Some(device_id) = rotated else {
+            break;
+        };
+        recovery.pin = Some(device_id);
+        recovery.skip_routes.clear();
+        retry_deadline = Some(next_deadline);
     }
 
-    playback_routes::with_state(|state| state.note_round(all_empty));
+    playback_routes::with_state(|state| state.note_round(recovery.all_empty));
+    if let Some(mut answer) = rejected {
+        if has_codec_rejection {
+            answer.resolved = VideoSourceResolution::CodecRejected;
+            // 编码门到这一步已经拒绝了所有原生可解码档(主列表与 H.265 门都试过)。
+            // 声明了自带转码器的客户端还能播 `bytevc2`,所以把地址还给
+            // 它,而不是继续回拒绝;编码名一并透出,客户端据此起转码。
+            if transcodes_bytevc2 {
+                if let VideoSourceResolution::Found(url, key) = transcodable_source(&answer) {
+                    answer.resolved = VideoSourceResolution::Found(url, key);
+                    answer.codec = BYTEVC2_CODEC;
+                }
+            }
+        }
+        return Ok(answer);
+    }
     let (empty_rounds, rotations) =
         playback_routes::with_state(|state| (state.empty_rounds(), state.rotations()));
     log::warn!(
-        "v5 trace request={request_id} purpose={purpose} event=final result=empty attempts={attempts} empty_rounds={empty_rounds} rotations={rotations}"
+        "v5 trace request={request_id} purpose={purpose} event=final result=empty attempts={} empty_rounds={empty_rounds} rotations={rotations}",
+        recovery.attempts,
     );
     Err(ApiError::Internal("视频取流失败,请稍后重试".to_string()))
 }
 
-async fn fetch_parsed_video_response(
-    source: &str,
+async fn fetch_parsed_playback_model(
+    ctx: &Ctx,
     video_id: &str,
     deadline: Instant,
-    request: impl std::future::Future<Output = ApiResult<Vec<u8>>>,
-) -> Option<ParsedVideoResponse> {
+    purpose: &'static str,
+    recovery: &mut PlaybackRecovery,
+) -> Option<(ParsedVideoResponse, PlaybackModel)> {
     let trace = crate::upstream::playback_trace::current();
     let request_id = trace.as_ref().map_or(0, |trace| trace.request_id);
-    let purpose = trace.as_ref().map_or("other", |trace| trace.purpose);
-    let raw = match tokio::time::timeout_at(deadline, request).await {
-        Ok(Ok(raw)) => raw,
+    let model = match tokio::time::timeout_at(
+        deadline,
+        fetch_playback_model(ctx, video_id, deadline, purpose, recovery),
+    )
+    .await
+    {
+        Ok(Ok(model)) => model,
         Ok(Err(_)) => {
             log::warn!(
-                "v5 trace request={request_id} purpose={purpose} source={source} event=fetch error=request"
+                "v5 trace request={request_id} purpose={purpose} source=ladder event=fetch error=request"
             );
             return None;
         }
         Err(_) => {
             log::warn!(
-                "v5 trace request={request_id} purpose={purpose} source={source} event=fetch error=deadline"
+                "v5 trace request={request_id} purpose={purpose} source=ladder event=fetch error=deadline"
             );
             return None;
         }
     };
+    let source = model.route.tag();
+    let raw = &model.body;
     if raw.is_empty() {
         log::warn!(
             "v5 trace request={request_id} purpose={purpose} source={source} event=fetch error=empty body_len=0"
         );
         return None;
     }
-    let parsed = match ParsedVideoResponse::parse(&raw, Some(video_id)) {
+    let parsed = match ParsedVideoResponse::parse(raw, Some(video_id)) {
         Ok(parsed) => parsed,
         Err(_) => {
+            crate::upstream::playback_routes::with_state(|state| {
+                state.failed(
+                    model.route,
+                    crate::upstream::playback_routes::now_ms(),
+                    false,
+                )
+            });
             log::warn!(
                 "v5 trace request={request_id} purpose={purpose} source={source} event=fetch error=json body_len={}",
                 raw.len(),
@@ -717,6 +1061,13 @@ async fn fetch_parsed_video_response(
         }
     };
     if upstream_response_is_failure(&parsed.root) {
+        crate::upstream::playback_routes::with_state(|state| {
+            state.failed(
+                model.route,
+                crate::upstream::playback_routes::now_ms(),
+                false,
+            )
+        });
         log::warn!(
             "v5 trace request={request_id} purpose={purpose} source={source} event=fetch error=business body_len={}",
             raw.len(),
@@ -739,7 +1090,7 @@ async fn fetch_parsed_video_response(
         raw.len(),
         parsed.models.len(),
     );
-    Some(parsed)
+    Some((parsed, model))
 }
 
 fn upstream_response_is_failure(root: &Value) -> bool {
@@ -998,18 +1349,28 @@ fn resolve_video_source_direct(parsed: &ParsedVideoResponse) -> VideoSourceResol
             VideoSourceResolution::NotFound => {}
         }
     }
-    if parsed.models.iter().any(model_needs_fallback) {
-        return if codec_rejected {
-            VideoSourceResolution::CodecRejected
-        } else {
-            VideoSourceResolution::NotFound
-        };
+    // The legacy raw extractor must not run for a model whose own list cannot be
+    // decoded locally (encrypted array without a usable seed) or is bytevc2-only
+    // while a fallback door exists: it would hand back an undecodable `main_url`
+    // and skip the fallback entirely (`fallback_rejection_requires_a_conclusive_codec_decision`).
+    let defer = parsed.models.iter().any(|model| {
+        model_needs_fallback(model)
+            && (model_is_encrypted_without_seed(model) || model_primary_rejected_only(model))
+    });
+    if !defer {
+        if let VideoSourceResolution::Found(url, key) = extract_parsed_video_url(parsed) {
+            return VideoSourceResolution::Found(url, key);
+        }
     }
-    match extract_parsed_video_url(parsed) {
-        VideoSourceResolution::Found(url, key) => VideoSourceResolution::Found(url, key),
-        VideoSourceResolution::CodecRejected => VideoSourceResolution::CodecRejected,
-        VideoSourceResolution::NotFound if codec_rejected => VideoSourceResolution::CodecRejected,
-        VideoSourceResolution::NotFound => VideoSourceResolution::NotFound,
+    // Keep a shortplay codec rejection terminal when no fallback door exists.
+    // When a door exists the caller's fallback resolution owns the verdict, and
+    // a plain `CodecRejected` here would short-circuit it. A compatible primary
+    // already returned `Found` above, so a rejection never hides a playable
+    // model.
+    if codec_rejected && !defer {
+        VideoSourceResolution::CodecRejected
+    } else {
+        VideoSourceResolution::NotFound
     }
 }
 
@@ -1020,48 +1381,34 @@ async fn resolve_video_source_fallback_status(
     parsed: &ParsedVideoResponse,
     fallback_bodies: Option<&FallbackBodyCache>,
     deadline: Instant,
+    transcodes_bytevc2: bool,
 ) -> FallbackResolution {
     let mut codec_rejected = false;
     let mut conclusive = true;
     let mut attempted_fallback = false;
     for model in &parsed.models {
-        if !video_model_encrypted(model) {
-            continue;
-        }
         let fallback_url = fallback_api_url(model);
         if fallback_url.is_empty() {
             continue;
         }
         attempted_fallback = true;
-        let cached = fallback_bodies.and_then(|cache| {
-            let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
-            cache.get(&fallback_url).cloned()
-        });
-        if cached.is_none() && Instant::now() >= deadline {
-            conclusive = false;
-            break;
-        }
-        let fallback_result = match cached {
-            Some(fallback_data) => Ok(fallback_data),
-            None => fetch_fallback_video_info(ctx, video_id, source, &fallback_url, deadline)
-                .await
-                .map(Arc::new),
-        };
-        match fallback_result {
-            Ok(fallback_data) => match extract_fallback_video_source(fallback_data.as_ref()) {
-                VideoSourceResolution::Found(url, key) => {
-                    if let Some(cache) = fallback_bodies {
-                        let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
-                        cache
-                            .entry(fallback_url)
-                            .or_insert_with(|| fallback_data.clone());
-                    }
-                    return FallbackResolution::Found(url, key);
-                }
-                VideoSourceResolution::CodecRejected => codec_rejected = true,
-                VideoSourceResolution::NotFound => conclusive = false,
-            },
-            Err(_) => conclusive = false,
+        match resolve_fallback_body(
+            ctx,
+            video_id,
+            source,
+            &fallback_url,
+            fallback_bodies,
+            deadline,
+            transcodes_bytevc2,
+        )
+        .await
+        {
+            FallbackBody::Found(url, key) => return FallbackResolution::Found(url, key),
+            FallbackBody::Rejected => codec_rejected = true,
+            // A door that yielded nothing decodable while H.265 was never
+            // ruled out keeps the request retryable; a later model may still
+            // carry a playable source.
+            FallbackBody::NoSource => conclusive = false,
         }
     }
     if !codec_rejected && !attempted_fallback {
@@ -1082,8 +1429,195 @@ async fn resolve_video_source_fallback_status(
     }
 }
 
+/// The verdict of one `fallback_api` door: a decodable source, a terminal
+/// unsupported-codec rejection, or nothing conclusive.
+enum FallbackBody {
+    Found(String, Vec<u8>),
+    Rejected,
+    NoSource,
+}
+
+/// Turns one `fallback_api` door into a verdict for
+/// `resolve_video_source_fallback_status`. A playable original body wins
+/// immediately; only a rejected or empty original asks the same endpoint for its
+/// H.265 variant. A transport/parse/deadline failure retrieving H.265 is not a
+/// statement about the codec: it returns [`FallbackBody::NoSource`] so the
+/// request stays retryable. Only inspected bodies can be
+/// [`FallbackBody::Rejected`].
+async fn resolve_fallback_body(
+    ctx: &Ctx,
+    video_id: &str,
+    source: &str,
+    fallback_url: &str,
+    fallback_bodies: Option<&FallbackBodyCache>,
+    deadline: Instant,
+    transcodes_bytevc2: bool,
+) -> FallbackBody {
+    // Fetch (or reuse a cached) original door. A cached H.265 body is read
+    // below, not here, so the original verdict is always the real one.
+    let original_cache_key = fallback_url.to_string();
+    let cached_original = fallback_bodies.and_then(|cache| {
+        let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        cache.get(&original_cache_key).cloned()
+    });
+    let original = match cached_original {
+        Some(data) => data,
+        None if Instant::now() < deadline => {
+            match fetch_fallback_video_info(ctx, video_id, source, &original_cache_key, deadline)
+                .await
+            {
+                Ok(data) => Arc::new(data),
+                // Transport/parse/deadline failure: retryable, not a verdict.
+                Err(_) => return FallbackBody::NoSource,
+            }
+        }
+        None => return FallbackBody::NoSource,
+    };
+    let primary_outcome = extract_fallback_video_source(original.as_ref());
+    if let VideoSourceResolution::Found(url, key) = primary_outcome {
+        cache_fallback_body(fallback_bodies, Some(fallback_url), Some(original));
+        return FallbackBody::Found(url, key);
+    }
+    // 自带转码器的调用方需要这个刚被编码门拒掉的正文:留在它自己的键下,
+    // 最后一次尝试就能直接从里面取档,不必二次请求。下面 H.265 门用的是
+    // 另一个键,所以这份缓存遮不住它。
+    if transcodes_bytevc2 {
+        if let Some(cache) = fallback_bodies {
+            let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+            cache
+                .entry(original_cache_key.clone())
+                .or_insert_with(|| original.clone());
+        }
+    }
+    let primary_rejected = matches!(primary_outcome, VideoSourceResolution::CodecRejected);
+    let Some(alt) = h265_fallback_url(fallback_url) else {
+        // No `codec_type` to rewrite: only the original body could decide.
+        return if primary_rejected {
+            FallbackBody::Rejected
+        } else {
+            FallbackBody::NoSource
+        };
+    };
+    let fetched = {
+        let cached = fallback_bodies.and_then(|cache| {
+            let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+            cache.get(&alt).cloned()
+        });
+        match cached {
+            Some(data) => Some(data),
+            None if Instant::now() < deadline => {
+                match fetch_fallback_video_info(ctx, video_id, source, &alt, deadline).await {
+                    Ok(data) => Some(Arc::new(data)),
+                    // Transport/parse/deadline failure getting H.265: never a
+                    // conclusion about the codec, even if the original rejected.
+                    Err(_) => return FallbackBody::NoSource,
+                }
+            }
+            None => return FallbackBody::NoSource,
+        }
+    };
+    // Every failure branch above returned, so the fetch produced a body.
+    let Some(fetched) = fetched else {
+        return FallbackBody::NoSource;
+    };
+    let h265_outcome = extract_fallback_video_source(fetched.as_ref());
+    match h265_outcome {
+        VideoSourceResolution::Found(url, key) => {
+            cache_fallback_body(fallback_bodies, Some(&alt), Some(fetched));
+            FallbackBody::Found(url, key)
+        }
+        // Both doors were inspected and neither carries a decodable codec.
+        VideoSourceResolution::CodecRejected => FallbackBody::Rejected,
+        // A missing/undecodable H.265 body is not proof the codec is
+        // unsupported: keep it retryable. Only an inspected body that the codec
+        // gate itself rejects is terminal.
+        VideoSourceResolution::NotFound => FallbackBody::NoSource,
+    }
+}
+
+/// Stores one fetched `fallback_api` body under the endpoint URL it actually
+/// answered, but only when it carries a decodable tier. A bytevc2-only body is
+/// left uncached so the H.265 door of the same endpoint is still tried later in
+/// the request instead of being shadowed by an unusable body.
+fn cache_fallback_body(
+    cache: Option<&FallbackBodyCache>,
+    url: Option<&str>,
+    data: Option<Arc<Map<String, Value>>>,
+) {
+    let (Some(cache), Some(url), Some(data)) = (cache, url, data) else {
+        return;
+    };
+    if !fallback_body_is_cacheable(data.as_ref()) {
+        return;
+    }
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    cache.entry(url.to_string()).or_insert(data);
+}
+
 fn model_needs_fallback(model: &Map<String, Value>) -> bool {
-    video_model_encrypted(model) && !fallback_api_url(model).is_empty()
+    !fallback_api_url(model).is_empty()
+}
+
+/// True when the model's own `video_list` is the encrypted array shape and there
+/// is no *usable* seed to decrypt it. A non-empty string that fails base64
+/// decoding is no better than a missing seed: the shortplay extractor drops it
+/// via `audio_b64_decode(..).ok()` too, so the two must agree.
+fn model_is_encrypted_without_seed(model: &Map<String, Value>) -> bool {
+    let usable_seed = model
+        .get("key_seed")
+        .and_then(Value::as_str)
+        .filter(|seed| !seed.is_empty())
+        .and_then(|seed| audio_b64_decode(seed).ok())
+        .is_some();
+    video_model_encrypted(model) && !usable_seed
+}
+
+fn primary_variant_class(info: &Map<String, Value>) -> PrimaryVariantClass {
+    let playable_url = ["main_url", "backup_url", "backup_url_1", "play_url"]
+        .iter()
+        .filter_map(|key| info.get(*key).and_then(Value::as_str))
+        .any(|url| !url.trim().is_empty());
+    if !playable_url {
+        PrimaryVariantClass::None
+    } else if video_quality_score(info).is_some() {
+        PrimaryVariantClass::Compatible
+    } else {
+        PrimaryVariantClass::UnsupportedCodec
+    }
+}
+
+fn primary_variant_classes(model: &Map<String, Value>) -> Vec<PrimaryVariantClass> {
+    let mut classes = Vec::new();
+    let mut push = |item: &Value| {
+        if let Some(info) = item.as_object() {
+            classes.push(primary_variant_class(info));
+        } else if let Some(entries) = item.as_array() {
+            for entry in entries {
+                if let Some(info) = entry.as_object() {
+                    classes.push(primary_variant_class(info));
+                }
+            }
+        }
+    };
+    match model.get("video_list") {
+        Some(Value::Object(video_list)) => video_list.values().for_each(&mut push),
+        Some(Value::Array(video_list)) => video_list.iter().for_each(&mut push),
+        _ => {}
+    }
+    classes
+}
+
+/// True when the model's own `video_list` carries at least one variant and every
+/// entry is codec-rejected. Works for both `video_list` shapes, unlike
+/// [`video_model_encrypted`] which only reads the array form. The primary
+/// resolution and the H.265 fallback both use it so a pure-VVC list is only a
+/// terminal verdict after the fallback door has been tried.
+fn model_primary_rejected_only(model: &Map<String, Value>) -> bool {
+    let classes = primary_variant_classes(model);
+    !classes.is_empty()
+        && classes
+            .iter()
+            .all(|class| *class == PrimaryVariantClass::UnsupportedCodec)
 }
 
 async fn resolve_video_source_until(
@@ -1093,6 +1627,7 @@ async fn resolve_video_source_until(
     parsed: &ParsedVideoResponse,
     fallback_bodies: &FallbackBodyCache,
     deadline: Instant,
+    transcodes_bytevc2: bool,
 ) -> VideoSourceResolution {
     let direct = resolve_video_source_direct(parsed);
     if matches!(direct, VideoSourceResolution::Found(_, _)) {
@@ -1105,6 +1640,7 @@ async fn resolve_video_source_until(
         parsed,
         Some(fallback_bodies),
         deadline,
+        transcodes_bytevc2,
     )
     .await
     {
@@ -1245,9 +1781,10 @@ async fn extract_stream_variants(
     parsed: &ParsedVideoResponse,
     fallback_bodies: &FallbackBodyCache,
     primary_url: &str,
-    source_trace_id: u64,
+    source_trace: (u64, &str),
     deadline: Instant,
 ) -> (Vec<Value>, VariantCounts) {
+    let (source_trace_id, source) = source_trace;
     let trace_started = Instant::now();
     let mut scored = Vec::new();
     let mut batches: Vec<VariantCounts> = Vec::new();
@@ -1276,19 +1813,19 @@ async fn extract_stream_variants(
             let fallback_cache = fallback_bodies.clone();
             fallback_requests.push(Box::pin(async move {
                 let (batch, from_cache) =
-                    fallback_variant_rows(ctx, video_id, "v5", model, &fallback_cache, deadline)
+                    fallback_variant_rows(ctx, video_id, source, model, &fallback_cache, deadline)
                         .await;
                 (model_id, from_cache, batch)
             }));
         }
     }
     log::info!(
-        "stream trace request={source_trace_id} source=v5 event=variants_body elapsed_ms={} playable_tiers={local_tiers} fallback_models={fallback_models}",
+        "stream trace request={source_trace_id} source={source} event=variants_body elapsed_ms={} playable_tiers={local_tiers} fallback_models={fallback_models}",
         trace_started.elapsed().as_millis(),
     );
     for (model_id, from_cache, batch) in futures::future::join_all(fallback_requests).await {
         log::info!(
-            "stream trace request={source_trace_id} source=v5 model={model_id} event=variants_fallback elapsed_ms={} from_cache={from_cache} playable_tiers={}",
+            "stream trace request={source_trace_id} source={source} model={model_id} event=variants_fallback elapsed_ms={} from_cache={from_cache} playable_tiers={}",
             trace_started.elapsed().as_millis(),
             playable_variant_tier_count(&batch.rows),
         );
@@ -1314,36 +1851,75 @@ async fn fallback_variant_rows(
         // 多数模型本来就没有这一条,不是异常。
         return (VariantBatch::default(), false);
     }
+    // The primary resolution stores the endpoint it actually read under its own
+    // URL, which is the H.265 door when the original list was bytevc2-only.
+    // Consult that key before the original so a successful fallback is reused
+    // instead of re-fetching the original door (and vice versa).
+    let h265_url = h265_fallback_url(&fallback_url);
     let cached = {
-        let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
-        cache.get(&fallback_url).cloned()
+        let cache_guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+        h265_url
+            .as_deref()
+            .and_then(|alt| {
+                cache_guard
+                    .get(alt)
+                    .cloned()
+                    .map(|data| (alt.to_string(), data))
+            })
+            .or_else(|| {
+                cache_guard
+                    .get(&fallback_url)
+                    .cloned()
+                    .map(|data| (fallback_url.clone(), data))
+            })
     };
-    if let Some(fallback_data) = cached {
-        return (fallback_rows_from_body(fallback_data.as_ref()), true);
+    if let Some((_, cached_body)) = cached {
+        let batch = fallback_rows_from_body(cached_body.as_ref());
+        // Only a body that already carries a decodable tier is a usable cache
+        // hit; a cached VVC-only body (kept for other reasons) must not hide the
+        // H.265 door.
+        if playable_variant_tier_count(&batch.rows) > 0 {
+            return (batch, true);
+        }
     }
     if Instant::now() >= deadline {
         return (VariantBatch::default(), false);
     }
-    let fallback_data =
-        match fetch_fallback_video_info(ctx, video_id, source, &fallback_url, deadline).await {
-            Ok(fallback_data) => fallback_data,
-            Err(_) => {
-                // 有地址却拉不到,是这一档列表整片消失的另一种静默路径。
-                log::warn!(
-                    "video {video_id}: {source} fallback_api fetch failed (quality tiers lost)"
-                );
-                return (VariantBatch::default(), false);
-            }
-        };
-    let fallback_data = Arc::new(fallback_data);
-    let batch = fallback_rows_from_body(fallback_data.as_ref());
-    if playable_variant_tier_count(&batch.rows) > 0 {
-        let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
-        cache
+    let original = match fetch_fallback_video_info(ctx, video_id, source, &fallback_url, deadline)
+        .await
+    {
+        Ok(fallback_data) => Arc::new(fallback_data),
+        Err(_) => {
+            // 有地址却拉不到,是这一档列表整片消失的另一种静默路径。
+            log::warn!("video {video_id}: {source} fallback_api fetch failed (quality tiers lost)");
+            return (VariantBatch::default(), false);
+        }
+    };
+    // The original body is the first source of tiers. Only when it yields
+    // nothing decodable do we ask the same endpoint for its H.265 variant,
+    // which is where a bytevc2-only episode keeps the real quality ladder.
+    if fallback_body_is_cacheable(original.as_ref()) {
+        let mut cache_guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+        cache_guard
             .entry(fallback_url)
-            .or_insert_with(|| fallback_data.clone());
+            .or_insert_with(|| original.clone());
+        return (fallback_rows_from_body(original.as_ref()), false);
     }
-    (batch, false)
+    if let Some(alt) = h265_url {
+        if Instant::now() < deadline {
+            if let Ok(h265_data) =
+                fetch_fallback_video_info(ctx, video_id, source, &alt, deadline).await
+            {
+                let h265_data = Arc::new(h265_data);
+                if fallback_body_is_cacheable(h265_data.as_ref()) {
+                    let mut cache_guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+                    cache_guard.entry(alt).or_insert_with(|| h265_data.clone());
+                    return (fallback_rows_from_body(h265_data.as_ref()), false);
+                }
+            }
+        }
+    }
+    (fallback_rows_from_body(original.as_ref()), false)
 }
 
 fn fallback_rows_from_body(fallback_data: &Map<String, Value>) -> VariantBatch {
@@ -1358,6 +1934,21 @@ fn fallback_rows_from_body(fallback_data: &Map<String, Value>) -> VariantBatch {
         .and_then(|s| audio_b64_decode(s).ok());
     let list = list.and_then(|d| d.get("video_list"));
     variant_rows_scored_any(list, key_seed)
+}
+
+/// Whether a fallback body is worth caching under its endpoint URL: it must
+/// yield at least one playable, codec-compatible tier. A bytevc2-only body is
+/// deliberately left uncached so the H.265 door of the same endpoint is still
+/// tried later in the request instead of being hidden by a poisoned cache
+/// entry.
+fn fallback_body_is_cacheable(fallback_data: &Map<String, Value>) -> bool {
+    let batch = fallback_rows_from_body(fallback_data);
+    playable_variant_tier_count(&batch.rows) > 0
+        && batch.rows.iter().all(|(_, row)| {
+            row.get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|url| !url.is_empty())
+        })
 }
 
 /// Why an entry in an upstream variant list never became a playable tier.
@@ -1825,6 +2416,43 @@ fn fallback_api_url(model: &Map<String, Value>) -> String {
     u
 }
 
+/// The same `fallback_api` endpoint re-served as H.265.
+///
+/// Some 漫剧 episodes only carry `bytevc2` (ByteDance VVC) tiers, and
+/// `codec_type=4` in the fallback URL asks for exactly those. No mpv build can
+/// decode VVC, but the same endpoint returns `h265_hvc1` tiers when asked for
+/// `codec_type=1`. Rewriting that one query parameter is enough to get a
+/// playable stream, so parse the parameter instead of matching the raw string.
+fn h265_fallback_url(url: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(url).ok()?;
+    let codec = parsed
+        .query_pairs()
+        .find_map(|(key, value)| (key == "codec_type").then_some(value.into_owned()));
+    match codec.as_deref() {
+        None | Some("1") => None,
+        Some(_) => {
+            let fragment = parsed.fragment().map(str::to_string);
+            let pairs: Vec<(String, String)> = parsed
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+            for (key, value) in pairs {
+                if key == "codec_type" {
+                    encoded.append_pair(&key, "1");
+                } else {
+                    encoded.append_pair(&key, &value);
+                }
+            }
+            parsed.set_query(Some(&encoded.finish()));
+            if let Some(fragment) = fragment {
+                parsed.set_fragment(Some(&fragment));
+            }
+            Some(parsed.into())
+        }
+    }
+}
+
 async fn fetch_fallback_video_info(
     ctx: &Ctx,
     video_id: &str,
@@ -1892,13 +2520,16 @@ fn extract_fallback_video_source(root: &Map<String, Value>) -> VideoSourceResolu
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .and_then(|s| audio_b64_decode(s).ok());
-    let Some(video_list) = data_root.get("video_list").and_then(|v| v.as_object()) else {
-        return VideoSourceResolution::NotFound;
-    };
-
-    select_video_source(video_list.values(), |info| {
-        decrypt_variant_entry(info, key_seed.as_deref())
-    })
+    // The fallback body may carry the same object or array `video_list` shapes
+    // the primary door does; route both through the shared selector so the codec
+    // gate applies identically. That selector is what returns `CodecRejected`
+    // for a bytevc2-only body, the terminal verdict the H.265 fallback relies on.
+    let resolve = |info: &Map<String, Value>| decrypt_variant_entry(info, key_seed.as_deref());
+    match data_root.get("video_list") {
+        Some(Value::Object(video_list)) => select_video_source(video_list.values(), resolve),
+        Some(Value::Array(video_list)) => select_video_source(video_list.iter(), resolve),
+        _ => VideoSourceResolution::NotFound,
+    }
 }
 
 fn select_video_source<'a>(
@@ -1906,9 +2537,22 @@ fn select_video_source<'a>(
     mut resolve: impl FnMut(&Map<String, Value>) -> Option<(String, Vec<u8>)>,
 ) -> VideoSourceResolution {
     let mut unresolved = VideoSourceResolution::NotFound;
-    let mut infos: Vec<_> = variants
-        .filter_map(|v| v.as_object())
+    let entries: Vec<_> = variants.filter_map(Value::as_object).collect();
+    let has_quality_metadata = entries.iter().any(|info| {
+        ["vwidth", "vheight", "bitrate", "real_bitrate", "video_meta"]
+            .iter()
+            .any(|field| info.contains_key(*field))
+    });
+    let mut infos: Vec<_> = entries
+        .into_iter()
         .filter_map(|info| match video_quality_score(info) {
+            Some(_)
+                if has_quality_metadata
+                    && (video_quality_metric(info, &["vwidth"]) <= 0
+                        || video_quality_metric(info, &["vheight"]) <= 0) =>
+            {
+                None
+            }
             Some(score) => Some((score, info)),
             None => {
                 unresolved = VideoSourceResolution::CodecRejected;
@@ -1919,10 +2563,105 @@ fn select_video_source<'a>(
     infos.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
     for (_, info) in infos {
         if let Some((url, key)) = resolve(info) {
-            return VideoSourceResolution::Found(url, key);
+            if playable_url_text(&url) {
+                return VideoSourceResolution::Found(url, key);
+            }
         }
     }
     unresolved
+}
+
+/// Last resort for a caller that transcodes `bytevc2` itself.
+///
+/// Only reached once the strict selector has refused every tier of every body
+/// this request already holds, so it can only turn a refusal into a stream that
+/// was rejected for its codec alone, never in place of one that plays as-is. No
+/// extra request: it reads the bodies the request already fetched.
+fn transcodable_source(answer: &ResolvedPlaybackModel) -> VideoSourceResolution {
+    for model in &answer.parsed.models {
+        if let VideoSourceResolution::Found(url, key) =
+            extract_transcodable_video_model_source(model)
+        {
+            return VideoSourceResolution::Found(url, key);
+        }
+    }
+    let bodies: Vec<Arc<Map<String, Value>>> = answer
+        .fallback_bodies
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    for body in bodies {
+        if let VideoSourceResolution::Found(url, key) =
+            extract_transcodable_fallback_source(body.as_ref())
+        {
+            return VideoSourceResolution::Found(url, key);
+        }
+    }
+    VideoSourceResolution::NotFound
+}
+
+/// The model's own list read with the codec gate relaxed to `bytevc2`.
+/// URL decryption and content-key derivation use the shared entry extractor.
+fn extract_transcodable_video_model_source(model: &Map<String, Value>) -> VideoSourceResolution {
+    let key_seed = model
+        .get("key_seed")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| audio_b64_decode(s).ok());
+    // CENC encrypts the media, not necessarily its URL. Plain URLs need only
+    // the entry's spade content key; encrypted URLs still require key_seed.
+    let resolve = |info: &Map<String, Value>| decrypt_variant_entry(info, key_seed.as_deref());
+    transcodable_list_source(model.get("video_list"), resolve)
+}
+
+/// A `fallback_api` body read with the codec gate relaxed to `bytevc2`.
+fn extract_transcodable_fallback_source(root: &Map<String, Value>) -> VideoSourceResolution {
+    let Some(data_root) = root
+        .get("video_info")
+        .and_then(|v| v.get("data"))
+        .and_then(|v| v.as_object())
+    else {
+        return VideoSourceResolution::NotFound;
+    };
+    let key_seed = data_root
+        .get("key_seed")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| audio_b64_decode(s).ok());
+    let resolve = |info: &Map<String, Value>| decrypt_variant_entry(info, key_seed.as_deref());
+    transcodable_list_source(data_root.get("video_list"), resolve)
+}
+
+/// Picks the best `bytevc2` tier out of either `video_list` shape.
+///
+/// Ranking is [`video_quality_rank`], and only `bytevc2` entries are kept: a
+/// natively decodable tier never reaches here, because the strict pass would
+/// have returned it.
+fn transcodable_list_source(
+    video_list: Option<&Value>,
+    mut resolve: impl FnMut(&Map<String, Value>) -> Option<(String, Vec<u8>)>,
+) -> VideoSourceResolution {
+    let entries: Vec<&Map<String, Value>> = match video_list {
+        Some(Value::Object(list)) => list.values().filter_map(Value::as_object).collect(),
+        Some(Value::Array(list)) => list.iter().filter_map(Value::as_object).collect(),
+        _ => return VideoSourceResolution::NotFound,
+    };
+    let mut infos: Vec<(i64, &Map<String, Value>)> = entries
+        .into_iter()
+        .filter(|info| is_bytevc2(info))
+        .map(|info| (video_quality_rank(info), info))
+        .collect();
+    infos.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    for (_, info) in infos {
+        if let Some((url, key)) = resolve(info) {
+            if playable_url_text(&url) {
+                return VideoSourceResolution::Found(url, key);
+            }
+        }
+    }
+    VideoSourceResolution::NotFound
 }
 
 /// Newer models keep quality under `video_meta`; older models put it on the entry.
@@ -1944,31 +2683,55 @@ fn video_quality_score(info: &Map<String, Value>) -> Option<i64> {
     // (H.266-class) has no decoder on the playback path, so a variant that
     // carries it must never win the quality race even as a last resort;
     // H.264 decodes everywhere, so it wins ties at equal quality.
-    let codec = {
-        let mut value = String::new();
-        if let Some(v) = info.get("codec_type").and_then(|v| v.as_str()) {
-            value.push_str(&v.to_lowercase());
-        }
-        if let Some(meta) = info.get("video_meta").and_then(|v| v.as_object()) {
-            if let Some(v) = meta.get("codec_type").and_then(|v| v.as_str()) {
-                value.push(' ');
-                value.push_str(&v.to_lowercase());
-            }
-        }
-        if let Some(v) = info.get("gear_des_key").and_then(|v| v.as_str()) {
+    if is_bytevc2(info) {
+        return None;
+    }
+    Some(video_quality_rank(info))
+}
+
+/// Every codec label an upstream entry carries, lowercased into one string:
+/// `codec_type` at the entry root and inside `video_meta`, plus `gear_des_key`
+/// (which spells the codec in the tier name, `bytevc2_1080p`).
+fn video_codec_text(info: &Map<String, Value>) -> String {
+    let mut value = String::new();
+    if let Some(v) = info.get("codec_type").and_then(|v| v.as_str()) {
+        value.push_str(&v.to_lowercase());
+    }
+    if let Some(meta) = info.get("video_meta").and_then(|v| v.as_object()) {
+        if let Some(v) = meta.get("codec_type").and_then(|v| v.as_str()) {
             value.push(' ');
             value.push_str(&v.to_lowercase());
         }
-        value
-    };
-    if codec.contains("bytevc2") {
-        return None;
     }
+    if let Some(v) = info.get("gear_des_key").and_then(|v| v.as_str()) {
+        value.push(' ');
+        value.push_str(&v.to_lowercase());
+    }
+    value
+}
+
+/// The ByteDance VVC tier: no playback path decodes it without a client-side
+/// transcode, so the strict gate refuses it (`CRIT-004`).
+fn is_bytevc2(info: &Map<String, Value>) -> bool {
+    video_codec_text(info).contains(BYTEVC2_CODEC)
+}
+
+/// Quality rank without the codec gate. H.264 wins ties at equal quality
+/// because it decodes everywhere; `bytevc2` loses them, because playing it
+/// costs a transcode on top of the bytes it already needs.
+fn video_quality_rank(info: &Map<String, Value>) -> i64 {
     let w = video_quality_metric(info, &["vwidth"]);
     let h = video_quality_metric(info, &["vheight"]);
     let b = video_quality_metric(info, &["bitrate", "real_bitrate"]);
-    let bonus = i64::from(codec.contains("h264") || codec.contains("avc1"));
-    Some(w * 1_000_000_000 + h * 1_000_000 + b + bonus)
+    let codec = video_codec_text(info);
+    let bonus = if codec.contains("h264") || codec.contains("avc1") {
+        1
+    } else if codec.contains(BYTEVC2_CODEC) {
+        -1
+    } else {
+        0
+    };
+    w * 1_000_000_000 + h * 1_000_000 + b + bonus
 }
 
 fn int64_from_any(v: &Value) -> i64 {
@@ -3209,21 +3972,50 @@ fn build_cenc_index(
     Ok(Some(index))
 }
 
+/// The codec an encrypted sample entry stood for, read from its `sinf/frma`.
+///
+/// `encv`/`enca` are generic wrappers: the real four-character code lives in
+/// the protection scheme's `frma`. Rewriting every `encv` to `hvc1` mislabels
+/// VVC (`vvc1`) and bytevc2 (`bvc2`) tracks, which then no longer decode.
+fn sample_entry_format(data: &[u8], entry: &Mp4Box) -> Option<[u8; 4]> {
+    let child_start = box_children_start(&entry.typ, entry.off, entry.header)?;
+    for child in iter_boxes(data, child_start, entry.off + entry.size) {
+        if child.typ != *b"sinf" {
+            continue;
+        }
+        for grand in iter_boxes(data, child.off + child.header, child.off + child.size) {
+            if grand.typ != *b"frma" || grand.off + 12 > data.len() {
+                continue;
+            }
+            let mut format = [0u8; 4];
+            format.copy_from_slice(&data[grand.off + 8..grand.off + 12]);
+            // A four-character code is printable ASCII; anything else means the
+            // box is damaged, and the caller's default is safer than copying it.
+            if format.iter().all(|b| (0x20..=0x7e).contains(b)) {
+                return Some(format);
+            }
+        }
+    }
+    None
+}
+
 /// Records the rewrites `rewrite_encrypted_sample_entries` used to apply in
-/// place (encv -> hvc1, enca -> mp4a, `sinf` blanked into a `free` box) as
-/// offset patches instead, so the file on disk keeps its original bytes.
+/// place (encv -> its `sinf/frma` codec, enca -> mp4a, `sinf` blanked into a
+/// `free` box) as offset patches instead, so the file on disk keeps its
+/// original bytes.
 fn collect_sample_entry_patches(
     data: &[u8],
     boxes: &HashMap<[u8; 4], Vec<Mp4Box>>,
     base_off: u64,
     out: &mut Vec<CencPatch>,
 ) {
-    for (typ, replacement) in [(b"encv", b"hvc1"), (b"enca", b"mp4a")] {
+    for (typ, fallback) in [(b"encv", b"hvc1"), (b"enca", b"mp4a")] {
         let Some(list) = boxes.get(typ) else {
             continue;
         };
         for b in list {
             if b.off + 8 <= data.len() {
+                let replacement = sample_entry_format(data, b).unwrap_or(*fallback);
                 out.push(CencPatch {
                     off: base_off + (b.off + 4) as u64,
                     bytes: replacement.to_vec(),
