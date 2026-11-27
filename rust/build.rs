@@ -1,4 +1,10 @@
 fn main() {
+    // The standalone service build has no Flutter bridge or desktop media
+    // surface. Keep its native dependency footprint to the Rust crates alone.
+    if std::env::var_os("CARGO_FEATURE_APP").is_none() {
+        return;
+    }
+
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
     // The encrypted-media C implementation (the same sources `CryptoDataSource`
     // links) is needed on iOS and macOS too: `desktop_media` exports the
