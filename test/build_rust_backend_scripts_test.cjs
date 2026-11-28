@@ -24,10 +24,7 @@ function readScript(name) {
 
 test('exactly one Rust build entry point exists per platform', () => {
   for (const name of ['build_rust_backend.ps1', 'build_rust_backend.sh']) {
-    assert.ok(
-      fs.existsSync(path.join(scriptsDir, name)),
-      `${name} must exist`,
-    );
+    assert.ok(fs.existsSync(path.join(scriptsDir, name)), `${name} must exist`);
   }
   for (const retired of ['build_backend.ps1', 'build_backend.sh']) {
     assert.ok(
@@ -42,7 +39,11 @@ test('the build scripts pin the same flutter_rust_bridge version as the crate', 
     path.join(appDir, 'rust', 'Cargo.toml'),
     'utf8',
   );
-  const crateVersion = /flutter_rust_bridge\s*=\s*"=([0-9.]+)"/.exec(crate);
+  const crateVersion =
+    /flutter_rust_bridge\s*=\s*"=([0-9.]+)"/.exec(crate) ||
+    /flutter_rust_bridge\s*=\s*\{[^}]*version\s*=\s*"=([0-9.]+)"[^}]*\}/.exec(
+      crate,
+    );
   assert.ok(crateVersion, 'rust/Cargo.toml must pin an exact FRB version');
 
   for (const name of ['build_rust_backend.ps1', 'build_rust_backend.sh']) {
@@ -66,14 +67,22 @@ test('the build scripts target Android ARM64 + ARMv7 with the project NDK and 16
   for (const name of ['build_rust_backend.ps1', 'build_rust_backend.sh']) {
     const source = readScript(name);
     assert.ok(source.includes('aarch64-linux-android'), name);
-    assert.ok(source.includes('armv7-linux-androideabi'), `${name} must build the 32-bit ARM target`);
-    assert.ok(source.includes('28.2.13676358'), `${name} must pin the project NDK`);
+    assert.ok(
+      source.includes('armv7-linux-androideabi'),
+      `${name} must build the 32-bit ARM target`,
+    );
+    assert.ok(
+      source.includes('28.2.13676358'),
+      `${name} must pin the project NDK`,
+    );
     assert.ok(
       source.includes('libfqapi_core.so'),
       `${name} must produce libfqapi_core.so`,
     );
     assert.ok(
-      source.includes('jniLibs') && source.includes('arm64-v8a') && source.includes('armeabi-v7a'),
+      source.includes('jniLibs') &&
+        source.includes('arm64-v8a') &&
+        source.includes('armeabi-v7a'),
       `${name} must install into jniLibs/arm64-v8a and jniLibs/armeabi-v7a`,
     );
   }
@@ -108,7 +117,8 @@ test('the APK workflow builds and verifies both ABIs', () => {
     'the APK workflow must split the APK per ABI instead of shipping one arm64-only package',
   );
   assert.ok(
-    workflow.includes('app-$abi-release.apk') || workflow.includes('app-armeabi-v7a-release.apk'),
+    workflow.includes('app-$abi-release.apk') ||
+      workflow.includes('app-armeabi-v7a-release.apk'),
     'the APK workflow must verify the 32-bit APK',
   );
   assert.ok(
@@ -157,10 +167,24 @@ test('the APK verifier expects the Rust core library for both ABIs', () => {
 
 test('APK unsigned classification accepts Gradle output and rejects damaged signatures', () => {
   const python = process.platform === 'win32' ? 'python' : 'python3';
-  const result = spawnSync(python, ['-m', 'unittest', 'discover', '-s', 'test',
-    '-p', 'verify_android_apk_test.py', '-v'], {
-    cwd: appDir, encoding: 'utf8', timeout: 30000,
-  });
+  const result = spawnSync(
+    python,
+    [
+      '-m',
+      'unittest',
+      'discover',
+      '-s',
+      'test',
+      '-p',
+      'verify_android_apk_test.py',
+      '-v',
+    ],
+    {
+      cwd: appDir,
+      encoding: 'utf8',
+      timeout: 30000,
+    },
+  );
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 });
 
@@ -322,7 +346,11 @@ test('workflow path filters are defined once and referenced by anchor', () => {
     );
     // 用 split 数出现次数而不是正则：模板字符串里写 \b 会变成退格符。
     const definitions = workflow.split(`paths: &${anchor}`).length - 1;
-    assert.equal(definitions, 1, `${file} must define paths once as &${anchor}`);
+    assert.equal(
+      definitions,
+      1,
+      `${file} must define paths once as &${anchor}`,
+    );
     const references = workflow.split(`paths: *${anchor}`).length - 1;
     assert.equal(
       references,
@@ -377,18 +405,26 @@ test('the shell build script keeps the cargo profile arguments in scope for --ho
   // 作用域；set -u 下引用未定义变量会直接退出。macOS 自带的 bash 3.2 在
   // set -u 下展开空数组同样会报未绑定变量，所以展开还要带 +"..." 保护。
   const source = readScript('build_rust_backend.sh');
-  assert.match(source, /^PROFILE_ARGS=\(\)$/m,
-    'PROFILE_ARGS must be assigned at script scope, not inside the function');
-  assert.ok(!/\blocal\s+profile_args\b/.test(source),
-    'a function-local profile_args cannot be seen by the --host-lib branch');
+  assert.match(
+    source,
+    /^PROFILE_ARGS=\(\)$/m,
+    'PROFILE_ARGS must be assigned at script scope, not inside the function',
+  );
+  assert.ok(
+    !/\blocal\s+profile_args\b/.test(source),
+    'a function-local profile_args cannot be seen by the --host-lib branch',
+  );
 
   const references = (source.match(/\$\{PROFILE_ARGS\[@\]/g) || []).length;
-  const guarded = (source.match(
-    /\$\{PROFILE_ARGS\[@\]\+"\$\{PROFILE_ARGS\[@\]\}"/g,
-  ) || []).length;
+  const guarded = (
+    source.match(/\$\{PROFILE_ARGS\[@\]\+"\$\{PROFILE_ARGS\[@\]\}"/g) || []
+  ).length;
   assert.ok(guarded > 0, 'cargo build must receive the profile flags');
-  assert.equal(references, guarded * 2,
-    'every PROFILE_ARGS expansion must use the bash 3.2-safe ${a[@]+"${a[@]}"} form');
+  assert.equal(
+    references,
+    guarded * 2,
+    'every PROFILE_ARGS expansion must use the bash 3.2-safe ${a[@]+"${a[@]}"} form',
+  );
 });
 
 test('the PowerShell build script keeps the profile arguments in scope for -HostLib', () => {
@@ -413,34 +449,51 @@ test('the PowerShell build script keeps the profile arguments in scope for -Host
 });
 
 test('the Rust build and host-test scripts always honor Cargo.lock', () => {
-  const invocations = (source) => source.split('\n').filter((line) => {
-    const trimmed = line.trimStart();
-    return /cargo build --/.test(line) && !trimmed.startsWith('echo') &&
-      !trimmed.startsWith('#');
-  });
+  const invocations = (source) =>
+    source.split('\n').filter((line) => {
+      const trimmed = line.trimStart();
+      return (
+        /cargo build --/.test(line) &&
+        !trimmed.startsWith('echo') &&
+        !trimmed.startsWith('#')
+      );
+    });
 
   for (const name of ['build_rust_backend.sh', 'run_rust_host_tests.sh']) {
     const lines = invocations(readScript(name));
     assert.ok(lines.length > 0, `${name} must invoke cargo build`);
     for (const line of lines) {
-      assert.ok(line.includes('--locked'),
-        `${name}: cargo build must use --locked: ${line.trim()}`);
+      assert.ok(
+        line.includes('--locked'),
+        `${name}: cargo build must use --locked: ${line.trim()}`,
+      );
     }
   }
 
   const psBuild = readScript('build_rust_backend.ps1');
-  const psInvocations = psBuild.split('\n').filter((line) => line.includes("@('build'"));
-  assert.equal(psInvocations.length, 2,
-    'build_rust_backend.ps1 must build the Android targets and -HostLib');
+  const psInvocations = psBuild
+    .split('\n')
+    .filter((line) => line.includes("@('build'"));
+  assert.equal(
+    psInvocations.length,
+    2,
+    'build_rust_backend.ps1 must build the Android targets and -HostLib',
+  );
   for (const line of psInvocations) {
-    assert.ok(line.includes("'--locked'"),
-      `build_rust_backend.ps1: cargo build must use --locked: ${line.trim()}`);
+    assert.ok(
+      line.includes("'--locked'"),
+      `build_rust_backend.ps1: cargo build must use --locked: ${line.trim()}`,
+    );
   }
   const psHostTests = readScript('run_rust_host_tests.ps1');
-  const hostLine = psHostTests.split('\n').find((line) => /cargo build --/.test(line));
+  const hostLine = psHostTests
+    .split('\n')
+    .find((line) => /cargo build --/.test(line));
   assert.ok(hostLine, 'run_rust_host_tests.ps1 must invoke cargo build');
-  assert.ok(hostLine.includes('--locked'),
-    `run_rust_host_tests.ps1: cargo build must use --locked: ${hostLine.trim()}`);
+  assert.ok(
+    hostLine.includes('--locked'),
+    `run_rust_host_tests.ps1: cargo build must use --locked: ${hostLine.trim()}`,
+  );
 });
 
 test('the Windows workflow resolves dependencies against the lockfile', () => {
