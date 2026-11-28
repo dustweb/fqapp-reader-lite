@@ -65,6 +65,7 @@ import 'services/player_style_config.dart';
 import 'services/short_series_font_scale.dart';
 import 'services/playlet_share.dart';
 import 'services/poster_cache.dart';
+import 'services/source_policy_controller.dart';
 import 'services/shelf_group_store.dart';
 import 'services/shelf_store.dart';
 import 'services/shelf_view_store.dart';
@@ -310,6 +311,7 @@ Future<void> _loadLocalData() async {
   // 否则广播到达时 Dart 侧还没有处理函数，原生侧只能按“未处理”回。
   FairMemoryService.instance.init();
   final sp = await spFuture;
+  _startSourcePolicy(sp);
   // Note: Optional preference schemas cannot block local data startup; see
   // .agents/notes/implemented/bug-fix/2026-09-17-persistent-data-and-web-cancellation.md.
   final savedTheme = sp.get(themeModeKey);
@@ -328,6 +330,24 @@ Future<void> _loadLocalData() async {
   // 短剧分区上次停在哪个频道（官方 SP `last_tab_type`）：同样只读一次，
   // 页面在 initState 同步取用，首帧不会先闪「推荐」。
   DramaChannelPreferences.load(sp);
+}
+
+SourcePolicyController? _sourcePolicyController;
+
+/// Starts the A5 runtime policy once. Bootstrap retries reuse the same
+/// controller so the lifecycle observer is never registered twice.
+void _startSourcePolicy(SharedPreferences preferences) {
+  final existing = _sourcePolicyController;
+  if (existing != null) {
+    existing.start();
+    return;
+  }
+  final controller = SourcePolicyController(
+    api: ApiClient.instance,
+    preferences: preferences,
+  );
+  _sourcePolicyController = controller;
+  controller.start();
 }
 
 class FqApp extends StatefulWidget {

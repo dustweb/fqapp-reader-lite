@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:isolate';
+import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 
 import '../models/audio_extra.dart';
@@ -33,7 +35,11 @@ import 'api_response_decoder.dart';
 import 'backend_service.dart';
 import 'backend_transport.dart';
 import 'chapter_text_formatter.dart';
+import 'full_chapter_crypto.dart';
 import 'request_gate.dart';
+import 'source_router.dart';
+import 'source_policy.dart';
+import 'source_response_compare.dart';
 
 export '../models/homepage_page.dart';
 part 'reader_video_api.dart';
@@ -63,11 +69,15 @@ enum PlaybackPurpose {
 class ApiClient {
   ApiClient({
     http.Client? client,
+    http.Client? remoteClient,
     BackendTransport? transport,
     String? baseUrl,
+    SourceRouter? sourceRouter,
     this._timeout = const Duration(seconds: 20),
     this._comicTimeout = const Duration(seconds: 90),
-  }) : _transport =
+  }) : _sourceRouter = sourceRouter ?? SourceRouter(),
+       _remoteClient = remoteClient ?? http.Client(),
+       _transport =
            transport ??
            (client != null || baseUrl != null
                ? HttpBackendTransport(
@@ -173,6 +183,18 @@ class ApiClient {
   /// which shares the same Rust dispatcher.
   final BackendTransport _transport;
 
+  /// Source routing decision point (A1). Consulted once per dispatch in
+  /// [_get]; under the default configuration every group resolves to the
+  /// local core, so this never changes behavior yet.
+  final SourceRouter _sourceRouter;
+
+  /// The remote source endpoint is a separate HTTPS service, so it cannot go
+  /// through the local FFI transport or its loopback capability.
+  final http.Client _remoteClient;
+
+  /// At most one A5 local-vs-remote structure comparison may run at a time.
+  bool _fullResponseComparisonInFlight = false;
+
   /// 视频 tab（短剧 feed）的 cell id，按 tab_type 缓存：官方第二段
   /// `bookmall/cell/change` 必须带这个 tab 的 cell，而它只出现在第一段的响应里。
   /// 每个 tab 一个值，几天内都不会变；取不到时按老路径走，所以缓存过期只会
@@ -223,6 +245,30 @@ class ApiClient {
       return raw;
     }
     return resolveBackendResource(_resourceBase, raw);
+  }
+
+  /// Whether [bookId] is in the exact A3 full-chapter pilot. The reader uses
+  /// this before touching its caches so a pilot chapter is never satisfied by
+  /// stale local text.
+  bool usesRemoteFullChapter(String bookId) =>
+      _sourceRouter.usesFullChapterPilot(bookId);
+
+  /// Whether [bookId] is in the exact A4-M manga-chapter pilot. The comic
+  /// reader uses this before choosing its metadata path.
+  bool usesMangaPilot(String bookId) => _sourceRouter.usesMangaPilot(bookId);
+
+  /// Whether this build has an explicitly configured remote source origin.
+  bool get hasRemoteSource => _sourceRouter.hasRemoteSource;
+
+  /// Applies a validated A5 routing policy to subsequent requests.
+  ///
+  /// The policy can only select the narrow full-chapter and manga-chapter
+  /// scopes. Account and system requests stay pinned to the local core.
+  void applyRuntimeSourceConfig(
+    SourceRuntimeConfig config, {
+    DateTime? expiresAt,
+  }) {
+    _sourceRouter.applyRuntimeConfig(config, expiresAt: expiresAt);
   }
 
   /// Decodes and envelope-checks a response body.
@@ -283,6 +329,9 @@ class ApiClient {
         // 追加本地用途参数发生在 gate key 形成之后:同 URL 的
         // foreground/prefetch 仍共享一次在飞请求,用途代表实际发起者。
         final target = _withPlaybackPurpose(url, playbackPurpose);
+        // A1 传输路由：默认全 local，此处恒放行；某组被配置切到 remote 时
+        // 在远程执行器落地前以 StateError 明确失败，不静默回落。
+        _sourceRouter.requireLocal(target);
         final response = await _transport.send(
           method,
           target,
@@ -357,6 +406,75 @@ class ApiClient {
 
   String _url(String path, Map<String, String> query) =>
       Uri.parse(_base).resolve(path).replace(queryParameters: query).toString();
+
+  Map<String, String> _remoteHeaders(
+    Uri target,
+    List<int> body, {
+    String method = 'POST',
+  }) {
+    final verb = method.toUpperCase();
+    final token = _sourceRouter.config.installToken;
+    final signingKey = _sourceRouter.config.installSigningKey;
+    final loopback = _isLoopbackHost(target.host);
+    if (token == null && signingKey == null) {
+      if (loopback) {
+        return {
+          'Accept': 'application/json',
+          if (verb != 'GET') 'Content-Type': 'application/json; charset=utf-8',
+        };
+      }
+      throw const ApiException('远程源服务未配置鉴权');
+    }
+    if (token == null ||
+        token.isEmpty ||
+        signingKey == null ||
+        signingKey.isEmpty) {
+      throw const ApiException('远程源服务鉴权配置无效');
+    }
+
+    final timestamp = (DateTime.now().millisecondsSinceEpoch ~/ 1000)
+        .toString();
+    final nonce = _randomHex(16);
+    final bodyHash = sha256.convert(body).toString();
+    final canonical = '$verb\n${target.path}\n$timestamp\n$nonce\n$bodyHash';
+    final signature = Hmac(
+      sha256,
+      utf8.encode(signingKey),
+    ).convert(utf8.encode(canonical)).toString();
+    return {
+      'Accept': 'application/json',
+      if (verb != 'GET') 'Content-Type': 'application/json; charset=utf-8',
+      'Authorization': 'Bearer $token',
+      'X-FQ-Timestamp': timestamp,
+      'X-FQ-Nonce': nonce,
+      'X-FQ-Signature': 'v1=$signature',
+    };
+  }
+
+  static String _randomHex(int bytes) {
+    final random = Random.secure();
+    final output = StringBuffer();
+    for (var i = 0; i < bytes; i++) {
+      output.write(random.nextInt(256).toRadixString(16).padLeft(2, '0'));
+    }
+    return output.toString();
+  }
+
+  static bool _isLoopbackHost(String host) {
+    final normalized = host.toLowerCase();
+    if (normalized == 'localhost' || normalized == '::1') return true;
+    final parts = normalized.split('.');
+    if (parts.length != 4 || !parts.every(_isDecimalOctet)) return false;
+    return int.parse(parts.first) == 127;
+  }
+
+  static bool _isDecimalOctet(String value) {
+    if (value.isEmpty || value.length > 3) return false;
+    for (final codeUnit in value.codeUnits) {
+      if (codeUnit < 0x30 || codeUnit > 0x39) return false;
+    }
+    return int.parse(value) <= 255;
+  }
 
   /// Directory route for [bookId].
   ///
@@ -1459,6 +1577,114 @@ class ApiClient {
     });
   }
 
+  /// Loads the exact A4-M remote manga chapter.
+  ///
+  /// The service returns only image URLs and the chapter key; every image is
+  /// downloaded and decrypted by the app. A malformed response or failure here
+  /// never falls back to [comicImages] or the local core.
+  Future<List<ComicImage>> remoteComicImages(
+    String bookId,
+    String itemId,
+  ) async {
+    if (!_sourceRouter.usesMangaPilot(bookId)) {
+      throw StateError('Book is not in the remote manga pilot');
+    }
+    final endpoint = _sourceRouter.mangaChapterEndpoint();
+    if (endpoint == null) {
+      throw StateError('Remote manga endpoint is not configured');
+    }
+    final validId = RegExp(r'^[A-Za-z0-9_-]{1,128}$');
+    if (!validId.hasMatch(bookId) || !validId.hasMatch(itemId)) {
+      throw const ApiException('漫画参数无效');
+    }
+
+    final watch = Stopwatch()..start();
+    const route = 'POST /api/v1/manga/chapter';
+    try {
+      final requestBody = Uint8List.fromList(
+        utf8.encode(jsonEncode({'item_id': itemId})),
+      );
+      final response = await _remoteClient
+          .post(
+            endpoint,
+            headers: _remoteHeaders(endpoint, requestBody),
+            body: requestBody,
+          )
+          .timeout(_timeout);
+      final status = response.statusCode;
+      final bytes = response.bodyBytes;
+      final payload = await decodeResponseBody(
+        bytes.length,
+        () => _decodeEnvelope(status, bytes),
+      );
+      if (payload['code'] != 0) {
+        throw const ApiException('远程漫画业务码异常');
+      }
+      final relay = payload['relay'];
+      if (relay is! Map || relay['protocol'] != 1) {
+        throw const ApiException('远程漫画协议不匹配');
+      }
+      final data = payload['data'];
+      if (data is! Map ||
+          data['item_id'] != itemId ||
+          data['pic_infos'] is! List) {
+        throw const ApiException('远程漫画缺少图片数据');
+      }
+      final key = data['encrypt_key'];
+      final keyPattern = RegExp(r'^[0-9a-fA-F]{64}$');
+      if (key is! String || !keyPattern.hasMatch(key)) {
+        throw const ApiException('远程漫画密钥无效');
+      }
+      final rawPages = data['pic_infos'] as List;
+      if (rawPages.isEmpty || rawPages.length > 64) {
+        throw const ApiException('远程漫画图片数量无效');
+      }
+      final pages = <ComicImage>[];
+      for (final rawPage in rawPages) {
+        final rawUrl = rawPage is Map ? rawPage['pic_url'] : null;
+        if (rawUrl is! String || !_isValidRemoteComicUrl(rawUrl)) {
+          throw const ApiException('远程漫画图片地址无效');
+        }
+        pages.add(ComicImage(url: rawUrl, encryptKeyHex: key.toLowerCase()));
+      }
+      watch.stop();
+      AppLog.d(
+        'api',
+        '$route $status ${watch.elapsedMilliseconds}ms '
+            'bytes=${bytes.length} images=${pages.length}',
+      );
+      return List.unmodifiable(pages);
+    } on ApiException catch (error) {
+      watch.stop();
+      AppLog.w(
+        'api',
+        '$route 失败 ${watch.elapsedMilliseconds}ms (${error.runtimeType})',
+      );
+      rethrow;
+    } catch (error) {
+      watch.stop();
+      AppLog.w(
+        'api',
+        '$route 失败 ${watch.elapsedMilliseconds}ms (${error.runtimeType})',
+      );
+      // Keep transport/JSON failures on the same typed path the reader already
+      // turns into its retryable error state.
+      throw const ApiException('远程漫画加载失败');
+    }
+  }
+
+  static bool _isValidRemoteComicUrl(String raw) {
+    if (raw.isEmpty || raw.trim() != raw) return false;
+    final uri = Uri.tryParse(raw);
+    if (uri == null ||
+        (uri.scheme != 'http' && uri.scheme != 'https') ||
+        uri.host.isEmpty ||
+        uri.userInfo.isNotEmpty) {
+      return false;
+    }
+    return uri.path != '/src' && !uri.path.startsWith('/src/');
+  }
+
   /// Text-reader variant that combines JSON decode, nested content lookup and
   /// HTML cleanup in one background-isolate pass.
   Future<String> contentText(
@@ -1519,6 +1745,196 @@ class ApiClient {
       );
       if (text.trim().isEmpty) throw const ApiException('正文为空');
       return ChapterContent.fromPlainText(text);
+    }
+  }
+
+  /// Loads the exact A3 remote full-chapter pilot.
+  ///
+  /// This is intentionally a separate path from [chapterContent]: a remote
+  /// failure, malformed relay response, or local decrypt failure must escape to
+  /// the reader without trying `/novel`, `/content`, `/batch`, `/toutiao`, or a
+  /// cached body.
+  Future<ChapterContent> remoteFullChapterContent(
+    String bookId,
+    String itemId,
+  ) async {
+    final endpoint = _sourceRouter.fullChapterEndpoint(bookId);
+    if (endpoint == null) {
+      throw StateError('Book is not in the remote full pilot');
+    }
+    final validId = RegExp(r'^[A-Za-z0-9_-]{1,128}$');
+    if (!validId.hasMatch(bookId) || !validId.hasMatch(itemId)) {
+      throw const ApiException('章节参数无效');
+    }
+
+    final handshake = FullChapterHandshake.generate();
+    final watch = Stopwatch()..start();
+    const route = 'POST /api/v1/chapters/full';
+    try {
+      final requestBody = Uint8List.fromList(
+        utf8.encode(
+          jsonEncode({
+            'book_id': bookId,
+            'item_ids': [itemId],
+            'client_public_key': handshake.clientPublicKeyBase64,
+          }),
+        ),
+      );
+      final response = await _remoteClient
+          .post(
+            endpoint,
+            headers: _remoteHeaders(endpoint, requestBody),
+            body: requestBody,
+          )
+          .timeout(_timeout);
+      final status = response.statusCode;
+      final bytes = response.bodyBytes;
+      final payload = await decodeResponseBody(
+        bytes.length,
+        () => _decodeEnvelope(status, bytes),
+      );
+      if (payload['code'] != 0) {
+        throw const ApiException('远程正文业务码异常');
+      }
+
+      final relayRaw = payload['relay'];
+      if (relayRaw is! Map || relayRaw['protocol'] != 1) {
+        throw const ApiException('远程正文协议不匹配');
+      }
+      final suffix = relayRaw['content_suffix'];
+      if (suffix != null && suffix is! String) {
+        throw const ApiException('远程正文协议不匹配');
+      }
+
+      final data = payload['data'];
+      final itemInfos = data is Map ? data['item_infos'] : null;
+      final item = itemInfos is Map ? itemInfos[itemId] : null;
+      if (item is! Map) {
+        throw const ApiException('远程正文缺少章节数据');
+      }
+      final key = item['key'];
+      final content = item['content'];
+      if (key is! String ||
+          key.isEmpty ||
+          content is! String ||
+          content.isEmpty) {
+        throw const ApiException('远程正文缺少密钥或密文');
+      }
+
+      final text = await handshake.decryptChapterInBackground(
+        serverKeyBase64: key,
+        contentBase64: content,
+        contentSuffix: suffix is String ? suffix : '',
+      );
+      if (text.isEmpty) {
+        throw const ApiException('正文为空');
+      }
+      watch.stop();
+      AppLog.d(
+        'api',
+        '$route $status ${watch.elapsedMilliseconds}ms bytes=${bytes.length}',
+      );
+      if (_sourceRouter.config.compareFullResponses) {
+        unawaited(
+          _compareRemoteFullResponse(
+            bookId: bookId,
+            itemId: itemId,
+            remotePayload: payload,
+          ),
+        );
+      }
+      return ChapterContent.fromPlainText(text, illustrationsChecked: true);
+    } catch (error) {
+      watch.stop();
+      AppLog.w(
+        'api',
+        '$route 失败 ${watch.elapsedMilliseconds}ms (${error.runtimeType})',
+      );
+      rethrow;
+    } finally {
+      handshake.destroy();
+    }
+  }
+
+  /// A5-only local baseline for [remoteFullChapterContent].
+  ///
+  /// The local request is intentionally fire-and-forget. A comparison failure
+  /// never affects the remote result, and the log carries only safe field paths
+  /// and paragraph counts - never text, ids or keys.
+  Future<void> _compareRemoteFullResponse({
+    required String bookId,
+    required String itemId,
+    required Map<String, dynamic> remotePayload,
+  }) async {
+    if (_fullResponseComparisonInFlight) return;
+    _fullResponseComparisonInFlight = true;
+    try {
+      final response = await _get(
+        _url('/api/v1/chapters/full', {'book_id': bookId, 'item_ids': itemId}),
+      );
+      final status = response.statusCode;
+      final bytes = response.bodyBytes;
+      final localPayload = await decodeResponseBody(
+        bytes.length,
+        () => _decodeEnvelope(status, bytes),
+      );
+      final comparison = compareFullChapterResponses(
+        localPayload: localPayload,
+        remotePayload: remotePayload,
+        itemId: itemId,
+      );
+      if (comparison.matches) {
+        AppLog.d('source-compare', 'full json=ok');
+      } else {
+        AppLog.w('source-compare', 'full 不一致 ${comparison.mismatch}');
+      }
+    } catch (error) {
+      AppLog.w('source-compare', 'full 对照失败 (${error.runtimeType})');
+    } finally {
+      _fullResponseComparisonInFlight = false;
+    }
+  }
+
+  /// Downloads the signed A5 runtime policy.
+  ///
+  /// The request is a bodyless GET and is logged only as a route template.
+  /// Any HTTP, envelope or schema failure escapes to the controller, which
+  /// keeps an unexpired cached policy or fails closed to all-local.
+  Future<RemoteSourcePolicy> fetchRemoteSourcePolicy() async {
+    final endpoint = _sourceRouter.clientPolicyEndpoint();
+    if (endpoint == null) {
+      throw StateError('Remote source policy endpoint is not configured');
+    }
+
+    final watch = Stopwatch()..start();
+    const route = 'GET /api/v1/client-policy';
+    try {
+      final response = await _remoteClient
+          .get(
+            endpoint,
+            headers: _remoteHeaders(endpoint, const [], method: 'GET'),
+          )
+          .timeout(_timeout);
+      final status = response.statusCode;
+      final bytes = response.bodyBytes;
+      final payload = await decodeResponseBody(
+        bytes.length,
+        () => _decodeEnvelope(status, bytes),
+      );
+      final policy = RemoteSourcePolicy.fromJson(payload);
+      watch.stop();
+      AppLog.d(
+        'api',
+        '$route $status ${watch.elapsedMilliseconds}ms bytes=${bytes.length}',
+      );
+      return policy;
+    } catch (error) {
+      watch.stop();
+      AppLog.w(
+        'api',
+        '$route 失败 ${watch.elapsedMilliseconds}ms (${error.runtimeType})',
+      );
+      rethrow;
     }
   }
 
